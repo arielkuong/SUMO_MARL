@@ -32,23 +32,37 @@ def parse_ij(tls_id: str) -> Tuple[int, int]:
 
 # --------------------------- evaluation info saver ---------------------------
 class EvalHistory:
-    def __init__(self, logdir: str, run_name: str):
-        self.dir = Path(logdir); self.dir.mkdir(parents=True, exist_ok=True); self.run = run_name
+    def __init__(self, logdir: str, run_name: str, seed: int):
+        """
+        Saves KPI arrays under: <logdir>/seed<seed>/<run_name>_*.npy
+        Example dir: logs_grid_3/seed42/
+        """
+        self.base_dir = Path(logdir)
+        self.dir = self.base_dir / f"seed{int(seed)}"
+        self.dir.mkdir(parents=True, exist_ok=True)
+
+        self.run = run_name
         self.ret = self._load('avg_return.npy')
         self.thr = self._load('avg_throughput_veh_per_hour.npy')
         self.mtt = self._load('avg_mean_travel_time_s.npy')
         self.mwt = self._load('avg_mean_waiting_time_s.npy')
+
     def _path(self, fname: str) -> Path:
         return self.dir / f"{self.run}_{fname}"
+
     def _load(self, fname: str):
         p = self._path(fname)
         if p.exists():
-            try: return np.load(p)
-            except Exception: pass
+            try:
+                return np.load(p)
+            except Exception:
+                pass
         return None
+
     @staticmethod
     def _append(arr, val: float):
         return np.array([val], dtype=np.float64) if arr is None else np.concatenate([arr, [val]])
+
     def save(self, avg_return: float, avg_throughput: float, avg_travel_s: float, avg_wait_s: float):
         self.ret = self._append(self.ret, avg_return)
         self.thr = self._append(self.thr, avg_throughput)
@@ -60,22 +74,24 @@ class EvalHistory:
         np.save(self._path('avg_mean_waiting_time_s.npy'), self.mwt)
 
 
-def clear_eval_history(logdir: str, run_name: str):
+def clear_eval_history(logdir: str, run_name: str, seed: int):
     """
-    Remove old KPI .npy files for this specific run prefix only.
+    Remove old KPI .npy files for this specific run prefix only,
+    scoped to the seed subfolder: <logdir>/seed<seed>/.
+
     If `run_name` is falsy (None or ""), do nothing.
 
     Files removed (when run_name is provided):
-      {run_name}_avg_return.npy
-      {run_name}_avg_throughput_veh_per_hour.npy
-      {run_name}_avg_mean_travel_time_s.npy
-      {run_name}_avg_mean_waiting_time_s.npy
+      <logdir>/seed<seed>/{run_name}_avg_return.npy
+      <logdir>/seed<seed>/{run_name}_avg_throughput_veh_per_hour.npy
+      <logdir>/seed<seed>/{run_name}_avg_mean_travel_time_s.npy
+      <logdir>/seed<seed>/{run_name}_avg_mean_waiting_time_s.npy
     """
-    if not run_name:  # do nothing if no run name is provided
+    if not run_name:
         return
 
-    log_path = Path(logdir)
-    log_path.mkdir(parents=True, exist_ok=True)
+    seed_dir = Path(logdir) / f"seed{int(seed)}"
+    seed_dir.mkdir(parents=True, exist_ok=True)
 
     suffixes = [
         "avg_return.npy",
@@ -84,8 +100,7 @@ def clear_eval_history(logdir: str, run_name: str):
         "avg_mean_waiting_time_s.npy",
     ]
     for suf in suffixes:
-        (log_path / f"{run_name}_{suf}").unlink(missing_ok=True)
-        # print(logdir + '/' + run_name + '_' + suf + ' is removed')
+        (seed_dir / f"{run_name}_{suf}").unlink(missing_ok=True)
 
 # =============================== Graph Helpers ===============================
 def build_grid_edge_index(agent_ids: List[str]) -> torch.Tensor:
@@ -101,6 +116,20 @@ def build_grid_edge_index(agent_ids: List[str]) -> torch.Tensor:
     if not edges:
         return torch.zeros((2,0), dtype=torch.long)
     return torch.tensor(edges, dtype=torch.long).t().contiguous()
+
+# build batched edge index
+def build_batched_edge_index(edge_index: torch.Tensor, batch_size: int, num_nodes: int) -> torch.Tensor:
+    """
+    Replicates a single-graph edge_index for a batch of identical graphs.
+    edge_index: [2, E] over nodes 0..N-1
+    returns   : [2, B*E] over nodes 0..B*N-1, with per-batch offsets
+    """
+    Ei = edge_index
+    device = Ei.device
+    offsets = torch.arange(batch_size, device=device, dtype=Ei.dtype) * num_nodes  # [B]
+    src = Ei[0].unsqueeze(0) + offsets.unsqueeze(1)                                 # [B,E]
+    dst = Ei[1].unsqueeze(0) + offsets.unsqueeze(1)                                 # [B,E]
+    return torch.stack([src.reshape(-1), dst.reshape(-1)], dim=0)                   # [2,B*E]
 
 # =============================== neighbor mapping helpers ===============================
 

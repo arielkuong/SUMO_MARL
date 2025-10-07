@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from typing import Tuple, Optional
 
-# =============================== MLP Models ===============================
+# =================================== MLP Model ===================================
 class QNetMLP(nn.Module):
     def __init__(self, observation_dim: int, action_dim: int, hidden_units: int = 128):
         super().__init__()
@@ -16,6 +16,7 @@ class QNetMLP(nn.Module):
     def forward(self, state_tensor: torch.Tensor) -> torch.Tensor:
         return self.network(state_tensor)
 
+# ========================== LSTM (Recurrent) Model ===============================
 class RecurrentQNet(nn.Module):
     def __init__(self, observation_dim: int, action_dim: int, hidden_units: int = 128):
         super().__init__()
@@ -53,56 +54,8 @@ class RecurrentQNet(nn.Module):
         q_values = self.q_head(z)                   # [B, T, A]
         return q_values, hidden_state
 
-
-# class ActorMLP(nn.Module):
-#     def __init__(self, observation_dim: int, action_dim: int, hidden_units: int = 128):
-#         super().__init__()
-#         self.net = nn.Sequential(
-#             nn.Linear(observation_dim, hidden_units), nn.ReLU(),
-#             nn.Linear(hidden_units, hidden_units), nn.ReLU(),
-#             nn.Linear(hidden_units, action_dim)
-#         )
-#     def forward(self, state_tensor: torch.Tensor):
-#         return self.net(state_tensor)  # logits
-
-# =============================== LSTM Models ===============================
-# class ActorLSTM(nn.Module):
-#     def __init__(self, observation_dim: int, action_dim: int, hidden_units: int = 128):
-#         super().__init__()
-#         self.fc = nn.Linear(observation_dim, hidden_units)
-#         self.lstm = nn.LSTM(hidden_units, hidden_units, batch_first=True)
-#         self.logits = nn.Linear(hidden_units, action_dim)
-#         self.activation = nn.ReLU()
-#     def forward(self, obs_seq: torch.Tensor, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
-#         z = self.activation(self.fc(obs_seq))
-#         z, hidden_state = self.lstm(z, hidden_state)
-#         return self.logits(z), hidden_state  # [B,T,A]
-#
-# class CriticMLP(nn.Module):
-#     def __init__(self, observation_dim: int, hidden_units: int = 128):
-#         super().__init__()
-#         self.net = nn.Sequential(
-#             nn.Linear(observation_dim, hidden_units), nn.ReLU(),
-#             nn.Linear(hidden_units, hidden_units), nn.ReLU(),
-#             nn.Linear(hidden_units, 1)
-#         )
-#     def forward(self, state_tensor: torch.Tensor):
-#         return self.net(state_tensor).squeeze(-1)
-#
-# class CriticLSTM(nn.Module):
-#     def __init__(self, observation_dim: int, hidden_units: int = 128):
-#         super().__init__()
-#         self.fc = nn.Linear(observation_dim, hidden_units)
-#         self.lstm = nn.LSTM(hidden_units, hidden_units, batch_first=True)
-#         self.value_head = nn.Linear(hidden_units, 1)
-#         self.activation = nn.ReLU()
-#     def forward(self, obs_seq: torch.Tensor, hidden_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None):
-#         z = self.activation(self.fc(obs_seq))
-#         z, hidden_state = self.lstm(z, hidden_state)
-#         v = self.value_head(z).squeeze(-1)
-#         return v, hidden_state
-
 # ====================================== GNN models =========================================
+# Attention block
 class SimpleAttnMP(nn.Module):
     def __init__(self, node_dim: int, edge_dim: int = 0, hidden: int = 128):
         super().__init__()
@@ -137,7 +90,7 @@ class GNNPolicyQ(nn.Module):
             z = mp(z, edge_index, edge_attr)
         return self.head(z)
 
-
+# ====================================== GNN+LSTM models =========================================
 class GNNLSTMPolicyQ(nn.Module):
     """
     Spatio-temporal Q-network:
@@ -242,3 +195,417 @@ class GNNLSTMPolicyQ(nn.Module):
     ):
         Q_seq, new_hidden = self.forward(X_t.unsqueeze(1), edge_index, hidden)  # -> [B,1,N,A]
         return Q_seq[:, 0], new_hidden
+
+# =================================== A2C MLP Models ==================================
+
+class ActorMLP(nn.Module):
+    def __init__(self, obs_dim: int, action_dim: int, hidden: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, action_dim)
+        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)  # logits
+
+class CriticMLP(nn.Module):
+    def __init__(self, obs_dim: int, hidden: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1)
+        )
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).squeeze(-1)  # value
+
+# ===== Per-Agent centralized critic =====
+class CriticPAMLP(nn.Module):
+    """
+    Joint-observation critic with N outputs (one per agent).
+    Forward accepts [..., N*O] and returns [..., N].
+    """
+    def __init__(self, joint_obs_dim: int, n_agents: int, hidden: int = 128):
+        super().__init__()
+        self.n_agents = n_agents
+        self.net = nn.Sequential(
+            nn.Linear(joint_obs_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, n_agents)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, N*O] or [T, N*O] or [N*O]
+        y = self.net(x)
+        return y  # [..., N]
+
+# =================================== A2C LSTM Models  ==================================
+class ActorLSTM(nn.Module):
+    """
+    Shared decentralized actor. Accepts [B,T,N,O], [T,N,O], or [N,O].
+    Outputs logits [B,T,N,A] (or reduced dims accordingly).
+    """
+    def __init__(self, obs_dim: int, act_dim: int, hidden: int = 128):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.hidden = hidden
+        self.enc = nn.Linear(obs_dim, hidden)
+        self.lstm = nn.LSTM(hidden, hidden, batch_first=True)
+        self.pi = nn.Linear(hidden, act_dim)
+
+    def _normalize_btno(self, X: torch.Tensor) -> torch.Tensor:
+        # Accept [N,O], [T,N,O], or [B,T,N,O] -> return [B,T,N,O]
+        if X.dim() == 2:      # [N,O]
+            X = X.unsqueeze(0).unsqueeze(0)  # [1,1,N,O]
+        elif X.dim() == 3:    # [T,N,O]
+            X = X.unsqueeze(0)               # [1,T,N,O]
+        elif X.dim() != 4:
+            raise AssertionError(f"ActorLSTM expects [B,T,N,O]/[T,N,O]/[N,O], got {tuple(X.shape)}")
+        return X
+
+    def forward(self, X: torch.Tensor, hidden: Tuple[torch.Tensor, torch.Tensor]|None=None):
+        X = self._normalize_btno(X)  # [B,T,N,O]
+        B, T, N, O = X.shape
+        x = X.permute(0, 2, 1, 3).reshape(B*N, T, O)           # [B*N,T,O]
+        z = torch.relu(self.enc(x))                             # [B*N,T,H]
+        z, new_hidden = self.lstm(z, hidden)                    # hidden: (1, B*N, H)
+        logits = self.pi(z)                                     # [B*N,T,A]
+        logits = logits.view(B, N, T, self.act_dim).permute(0, 2, 1, 3).contiguous()  # [B,T,N,A]
+        return logits, new_hidden
+
+    @torch.no_grad()
+    def step(self, X_t: torch.Tensor, hidden: Tuple[torch.Tensor, torch.Tensor]|None=None):
+        """
+        Single-step policy: X_t is [N,O] or [1,1,N,O]. Returns logits [N,A], new hidden.
+        """
+        logits, new_hidden = self.forward(X_t, hidden)  # [1,1,N,A]
+        return logits[0, -1], new_hidden                # [N,A]
+
+class CriticLSTM(nn.Module):
+    """
+    Shared decentralized critic. Same input protocol as the actor.
+    Outputs values per agent: [B,T,N].
+    """
+    def __init__(self, obs_dim: int, hidden: int = 128):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.hidden = hidden
+        self.enc = nn.Linear(obs_dim, hidden)
+        self.lstm = nn.LSTM(hidden, hidden, batch_first=True)
+        self.v = nn.Linear(hidden, 1)
+
+    def _normalize_btno(self, X: torch.Tensor) -> torch.Tensor:
+        if X.dim() == 2:
+            X = X.unsqueeze(0).unsqueeze(0)
+        elif X.dim() == 3:
+            X = X.unsqueeze(0)
+        elif X.dim() != 4:
+            raise AssertionError(f"CriticLSTM expects [B,T,N,O]/[T,N,O]/[N,O], got {tuple(X.shape)}")
+        return X
+
+    def forward(self, X: torch.Tensor, hidden: Tuple[torch.Tensor, torch.Tensor]|None=None):
+        X = self._normalize_btno(X)  # [B,T,N,O]
+        B, T, N, O = X.shape
+        x = X.permute(0, 2, 1, 3).reshape(B*N, T, O)     # [B*N,T,O]
+        z = torch.relu(self.enc(x))
+        z, new_hidden = self.lstm(z, hidden)
+        vals = self.v(z).squeeze(-1)                     # [B*N,T]
+        vals = vals.view(B, N, T).permute(0, 2, 1).contiguous()  # [B,T,N]
+        return vals, new_hidden
+
+    @torch.no_grad()
+    def step(self, X_t: torch.Tensor, hidden: Tuple[torch.Tensor, torch.Tensor]|None=None):
+        vals, new_hidden = self.forward(X_t, hidden)   # [1,1,N]
+        return vals[0, -1], new_hidden                 # [N]
+
+class CriticPALSTM(nn.Module):
+    """
+    Centralised per-agent critic with temporal memory.
+    Accepts joint observations and outputs N values (one per agent) at each time step.
+
+    Input forms:
+      - [N, O]           -> returns (values [N], (h,c))
+      - [T, N, O]        -> returns (values [1, T, N], (h,c))  (B=1 implicit)
+      - [B, T, N, O]     -> returns (values [B, T, N], (h,c))
+
+    Notes:
+      - n_agents must match N at runtime.
+      - Hidden state shape: (num_layers=1, batch=B, hidden_size=hidden)
+        where batch is the first dim fed to the LSTM (B).
+    """
+    def __init__(self, joint_obs_dim: int, n_agents: int, hidden: int = 128):
+        super().__init__()
+        self.n_agents = n_agents
+        self.hidden = hidden
+        self.enc = nn.Linear(joint_obs_dim, hidden)
+        self.lstm = nn.LSTM(hidden, hidden, batch_first=True)  # expects [B, T, H]
+        self.v_head = nn.Linear(hidden, n_agents)
+
+    def _normalize_btno(self, X: torch.Tensor) -> torch.Tensor:
+        # Map [N,O]/[T,N,O]/[B,T,N,O] -> [B,T,N,O]
+        if X.dim() == 2:      # [N,O]
+            X = X.unsqueeze(0).unsqueeze(0)  # [1,1,N,O]
+        elif X.dim() == 3:    # [T,N,O]
+            X = X.unsqueeze(0)               # [1,T,N,O]
+        elif X.dim() != 4:    # else must already be [B,T,N,O]
+            raise AssertionError(f"CriticPALSTM expects [B,T,N,O]/[T,N,O]/[N,O], got {tuple(X.shape)}")
+        return X
+
+    def forward(
+        self,
+        X: torch.Tensor,
+        hidden: Tuple[torch.Tensor, torch.Tensor] | None = None
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        # X_btno: [B,T,N,O] -> flatten joint obs to J=N*O then LSTM over time
+        X = self._normalize_btno(X)
+        B, T, N, O = X.shape
+        assert N == self.n_agents, f"CriticPALSTM: n_agents mismatch (got N={N}, expected {self.n_agents})"
+        J = N * O
+        x_btj = X.reshape(B, T, J)                 # [B,T,J]
+        z = torch.relu(self.enc(x_btj))            # [B,T,H]
+        z_out, new_hidden = self.lstm(z, hidden)   # [B,T,H]
+        vals_btn = self.v_head(z_out)              # [B,T,N]
+        return vals_btn, new_hidden
+
+    @torch.no_grad()
+    def step(
+        self,
+        X_t: torch.Tensor,  # [N,O]
+        hidden: Tuple[torch.Tensor, torch.Tensor] | None = None
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Single-step evaluation:
+          returns (values [N], new_hidden)
+        """
+        vals_btn, new_hidden = self.forward(X_t, hidden)  # [1,1,N]
+        return vals_btn[0, -1], new_hidden
+
+# =================================== A2C GNN Models ==================================
+class ActorGNNAttn(nn.Module):
+    """
+    Shared decentralized actor over the traffic-light graph.
+    node_feats: [N, O], edge_index: [2, E] (src->dst), edge_attr: [E, D_e] or None
+    returns logits per node: [N, A]
+    """
+    def __init__(self, obs_dim: int, act_dim: int, hidden: int = 128, layers: int = 2, edge_dim: int = 0):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.hidden  = hidden
+        self.layers = nn.ModuleList([
+            SimpleAttnMP(obs_dim if i == 0 else hidden, edge_dim=edge_dim, hidden=hidden)
+            for i in range(layers)
+        ])
+        self.pi_head = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, act_dim)
+        )
+
+    def forward(self, node_feats: torch.Tensor, edge_index: torch.Tensor, edge_attr: Optional[torch.Tensor] = None) -> torch.Tensor:
+        z = node_feats
+        for mp in self.layers:
+            z = mp(z, edge_index, edge_attr)  # [N, H]
+        return self.pi_head(z)                # [N, A]
+
+
+class CriticGNNPerAgentAttn(nn.Module):
+    """
+    Per-agent value critic over the same graph.
+    node_feats: [N, O], edge_index: [2, E], edge_attr: [E, D_e] or None
+    returns per-node values: [N]
+    """
+    def __init__(self, obs_dim: int, hidden: int = 128, layers: int = 2, edge_dim: int = 0):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            SimpleAttnMP(obs_dim if i == 0 else hidden, edge_dim=edge_dim, hidden=hidden)
+            for i in range(layers)
+        ])
+        self.v_head = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1)
+        )
+
+    def forward(self, node_feats: torch.Tensor, edge_index: torch.Tensor, edge_attr: Optional[torch.Tensor] = None) -> torch.Tensor:
+        z = node_feats
+        for mp in self.layers:
+            z = mp(z, edge_index, edge_attr)  # [N, H]
+        return self.v_head(z).squeeze(-1)     # [N]
+
+# ============================ A2C GNN + LSTM Models ===========================
+class ActorGNNLSTMAttn(nn.Module):
+    """
+    Shared decentralised actor over a graph with temporal memory.
+
+    Per-step pipeline:
+      node_feats -> GNN (attention message passing) -> per-node emb H
+      Over time (per node): LSTM(H_t) -> logits
+
+    Inputs:
+      node_feats: [N,O]  (single step)  or  [T,N,O] (sequence)
+      edge_index: [2,E]  (long, src->dst)
+      edge_attr:  [E,De] or None
+
+    Returns:
+      (logits, new_hidden)
+        - logits: [N,A] for single step, or [T,N,A] for sequence
+        - new_hidden: (h, c) with shape [1, N, H]
+    """
+    def __init__(self, obs_dim: int, act_dim: int, hidden: int = 128, layers: int = 2, edge_dim: int = 0):
+        super().__init__()
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.hidden  = hidden
+
+        self.gnn_layers = nn.ModuleList([
+            SimpleAttnMP(obs_dim if i == 0 else hidden, edge_dim=edge_dim, hidden=hidden)
+            for i in range(layers)
+        ])
+        # batch_first=True -> input to LSTM is [N, T, H]
+        self.lstm = nn.LSTM(hidden, hidden, batch_first=True)
+        self.pi_head = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, act_dim)
+        )
+
+    def _mp_once(self, node_feats: torch.Tensor, edge_index: torch.Tensor, edge_attr: Optional[torch.Tensor]):
+        z = node_feats
+        for mp in self.gnn_layers:
+            z = mp(z, edge_index, edge_attr)  # [N,H]
+        return z
+
+    def forward(
+        self,
+        node_feats: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: Optional[torch.Tensor] = None,
+        hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        If node_feats is [N,O]: returns (logits [N,A], new_hidden)
+        If node_feats is [T,N,O]: returns (logits [T,N,A], new_hidden)
+        """
+        if node_feats.dim() == 2:
+            # ---------- single step ----------
+            # node_feats: [N,O]
+            z = self._mp_once(node_feats, edge_index, edge_attr)  # [N,H]
+            z_in = z.unsqueeze(1)                                  # [N,1,H] (time=1)
+            z_out, new_hidden = self.lstm(z_in, hidden)            # [N,1,H]
+            logits = self.pi_head(z_out.squeeze(1))                # [N,A]
+            return logits, new_hidden
+
+        elif node_feats.dim() == 3:
+            # ---------- sequence ----------
+            # node_feats: [T,N,O]
+            T, N, _ = node_feats.shape
+            z_seq = []
+            for t in range(T):
+                z_t = self._mp_once(node_feats[t], edge_index, edge_attr)  # [N,H]
+                z_seq.append(z_t)
+            z_seq = torch.stack(z_seq, dim=0)                               # [T,N,H]
+            z_seq_bn = z_seq.permute(1, 0, 2).contiguous()                  # [N,T,H]
+            z_out_bn, new_hidden = self.lstm(z_seq_bn, hidden)              # [N,T,H]
+            z_out = z_out_bn.permute(1, 0, 2).contiguous()                  # [T,N,H]
+            logits = self.pi_head(z_out)                                     # [T,N,A]
+            return logits, new_hidden
+
+        else:
+            raise AssertionError(f"ActorGNNLSTMAttn expects [N,O] or [T,N,O], got {tuple(node_feats.shape)}")
+
+    @torch.no_grad()
+    def step(
+        self,
+        node_feats_t: torch.Tensor,           # [N,O]
+        edge_index: torch.Tensor,
+        edge_attr: Optional[torch.Tensor] = None,
+        hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Single environment step:
+          returns (logits [N,A], new_hidden  [1,N,H])
+        """
+        logits, new_hidden = self.forward(node_feats_t, edge_index, edge_attr, hidden)
+        return logits, new_hidden
+
+
+class CriticGNNPerAgentLSTMAttn(nn.Module):
+    """
+    Per-agent value critic with GNN + LSTM temporal memory.
+
+    Inputs:
+      node_feats: [N,O] (single step) or [T,N,O] (sequence)
+      edge_index: [2,E], edge_attr: [E,De] or None
+
+    Returns:
+      (values, new_hidden)
+        - values: [N] for single step, or [T,N] for sequence
+        - new_hidden: (h, c) with shape [1, N, H]
+    """
+    def __init__(self, obs_dim: int, hidden: int = 128, layers: int = 2, edge_dim: int = 0):
+        super().__init__()
+        self.hidden = hidden
+        self.gnn_layers = nn.ModuleList([
+            SimpleAttnMP(obs_dim if i == 0 else hidden, edge_dim=edge_dim, hidden=hidden)
+            for i in range(layers)
+        ])
+        self.lstm = nn.LSTM(hidden, hidden, batch_first=True)   # input [N,T,H]
+        self.v_head = nn.Sequential(
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1)
+        )
+
+    def _mp_once(self, node_feats: torch.Tensor, edge_index: torch.Tensor, edge_attr: Optional[torch.Tensor]):
+        z = node_feats
+        for mp in self.gnn_layers:
+            z = mp(z, edge_index, edge_attr)  # [N,H]
+        return z
+
+    def forward(
+        self,
+        node_feats: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: Optional[torch.Tensor] = None,
+        hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if node_feats.dim() == 2:
+            # ---------- single step ----------
+            # node_feats: [N,O]
+            z = self._mp_once(node_feats, edge_index, edge_attr)  # [N,H]
+            z_in = z.unsqueeze(1)                                  # [N,1,H]
+            z_out, new_hidden = self.lstm(z_in, hidden)            # [N,1,H]
+            v = self.v_head(z_out.squeeze(1)).squeeze(-1)          # [N]
+            return v, new_hidden
+
+        elif node_feats.dim() == 3:
+            # ---------- sequence ----------
+            # node_feats: [T,N,O]
+            T, N, _ = node_feats.shape
+            z_seq = []
+            for t in range(T):
+                z_t = self._mp_once(node_feats[t], edge_index, edge_attr)  # [N,H]
+                z_seq.append(z_t)
+            z_seq = torch.stack(z_seq, dim=0)                               # [T,N,H]
+            z_seq_bn = z_seq.permute(1, 0, 2).contiguous()                  # [N,T,H]
+            z_out_bn, new_hidden = self.lstm(z_seq_bn, hidden)              # [N,T,H]
+            z_out = z_out_bn.permute(1, 0, 2).contiguous()                  # [T,N,H]
+            v = self.v_head(z_out).squeeze(-1)                              # [T,N]
+            return v, new_hidden
+
+        else:
+            raise AssertionError(f"CriticGNNPerAgentLSTMAttn expects [N,O] or [T,N,O], got {tuple(node_feats.shape)}")
+
+    @torch.no_grad()
+    def step(
+        self,
+        node_feats_t: torch.Tensor,           # [N,O]
+        edge_index: torch.Tensor,
+        edge_attr: Optional[torch.Tensor] = None,
+        hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Single environment step:
+          returns (values [N], new_hidden [1,N,H])
+        """
+        v, new_hidden = self.forward(node_feats_t, edge_index, edge_attr, hidden)
+        return v, new_hidden

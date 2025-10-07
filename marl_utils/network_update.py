@@ -4,9 +4,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.distributions import Categorical
 from typing import Dict, Tuple, List, Optional
 
-from marl_utils.common import to_tensor
+from marl_utils.common import to_tensor, build_batched_edge_index
 from marl_utils.models import QNetMLP, RecurrentQNet, GNNPolicyQ, GNNLSTMPolicyQ
 
 # =================================== DQN Update ====================================
@@ -23,7 +24,7 @@ def dqn_update(device: torch.device, online_q: QNetMLP, target_q: QNetMLP,
         next_actions = (online_q if double_dqn else target_q)(next_state_t).argmax(dim=1)
         next_q = target_q(next_state_t).gather(1, next_actions.unsqueeze(1)).squeeze(1)
         target = reward_t + (1.0 - done_t) * gamma * next_q
-    loss = nn.functional.mse_loss(q_taken, target)
+    loss = nn.functional.smooth_l1_loss(q_taken, target)
     optimizer_q.zero_grad(); loss.backward(); nn.utils.clip_grad_norm_(online_q.parameters(), 1.0); optimizer_q.step()
     return float(loss.item())
 
@@ -199,7 +200,7 @@ def dqn_update_shared_gnn(
             next_q_values = q_values_next_target.gather(1, next_actions.view(-1, 1)).squeeze(1)         # [N]
             target_q_values = reward_nodes + (1.0 - done_flag) * discount_gamma * next_q_values         # [N]; done_flag broadcasts
 
-        total_mse_loss = total_mse_loss + nn.functional.mse_loss(q_values_taken, target_q_values)
+        total_mse_loss = total_mse_loss + nn.functional.smooth_l1_loss(q_values_taken, target_q_values)
 
     total_mse_loss = total_mse_loss / batch_size
 
@@ -456,6 +457,1733 @@ def vdn_update_lstm(
 
     return float(loss.item())
 
+# =================== CTDE-specific: VDN update (Double-DQN) — GNN ======================
+def vdn_update_gnn(
+    device: torch.device,
+    gnn_online_q: nn.Module,          # GNNPolicyQ: per-agent Q_i with message-passing
+    gnn_target_q: nn.Module,          # target copy
+    optimizer: optim.Optimizer,
+    batch_tuple,                      # from JointReplayBuffer.sample -> (S, A, R, NS, D)
+    graph_edge_index: torch.Tensor,   # [2,E] directed, same for all items in batch
+    gamma: float = 0.99,
+    double_dqn: bool = True,
+    grad_clip: float = 1.0,
+) -> float:
+    """
+    VDN with GNN Q_i:
+      - Q_tot = sum_i Q_i
+      - Double-DQN targets per agent
+      - team reward = sum over per-agent rewards
+
+    Shapes from JointReplayBuffer:
+      S  : [B, N, O]
+      A  : [B, N]         (long)
+      R  : [B, N]         (float)
+      NS : [B, N, O]
+      D  : [B]            (float in {0,1})
+    """
+    import torch.nn as nn
+    S, A, R, NS, D = batch_tuple
+    B, N, O = S.shape
+
+    S_t  = torch.as_tensor(S,  device=device, dtype=torch.float32).view(B * N, O)  # [B*N,O]
+    NS_t = torch.as_tensor(NS, device=device, dtype=torch.float32).view(B * N, O)  # [B*N,O]
+    A_t  = torch.as_tensor(A,  device=device, dtype=torch.long).view(B * N)        # [B*N]
+    R_t  = torch.as_tensor(R,  device=device, dtype=torch.float32)                 # [B,N]
+    D_t  = torch.as_tensor(D,  device=device, dtype=torch.float32)                 # [B]
+
+    # Build batched edges once
+    Ei_batched = build_batched_edge_index(graph_edge_index.to(device), B, N)       # [2,B*E]
+
+    # Per-agent Q(s,a) (flattened across batch and nodes)
+    q_all = gnn_online_q(S_t, Ei_batched)                         # [B*N, A]
+    q_taken = q_all.gather(1, A_t.view(-1, 1)).squeeze(1)         # [B*N]
+    q_taken = q_taken.view(B, N)                                   # [B,N]
+    q_tot = q_taken.sum(dim=1)                                     # [B]
+
+    with torch.no_grad():
+        # Next actions via online (Double-DQN), per agent
+        q_next_online = gnn_online_q(NS_t, Ei_batched).view(B, N, -1)   # [B,N,A]
+        next_actions = q_next_online.argmax(dim=-1)                     # [B,N]
+
+        # Evaluate those actions on target net
+        q_next_target = gnn_target_q(NS_t, Ei_batched).view(B, N, -1)   # [B,N,A]
+        q_next_a = q_next_target.gather(-1, next_actions.unsqueeze(-1)).squeeze(-1)  # [B,N]
+        q_next_tot = q_next_a.sum(dim=1)                                 # [B]
+
+        # Team reward (sum over agents)
+        R_team = R_t.sum(dim=1)                                          # [B]
+        target = R_team + (1.0 - D_t) * gamma * q_next_tot               # [B]
+
+    loss = nn.functional.smooth_l1_loss(q_tot, target)
+
+    optimizer.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(gnn_online_q.parameters(), grad_clip)
+    optimizer.step()
+
+    return float(loss.item())
+
+# ============= CTDE-specific: VDN update (Double-DQN) — GNN+LSTM ===============
+def _shift_next_actions_double_dqn(
+    online_q, S_next: torch.Tensor, edge_index: torch.Tensor
+) -> torch.Tensor:
+    """
+    Argmax_a Q_online(S_next, a) per node across the sequence.
+    Input:  S_next [B, T, N, O]
+    Return: a_next [B, T, N] (long)
+    """
+    q_next, _ = online_q(S_next, edge_index, hidden=None)      # [B,T,N,A]
+    return q_next.argmax(dim=-1).long()                        # [B,T,N]
+
+
+def vdn_update_gnn_lstm(
+    device: torch.device,
+    gnnlstm_online_q,                # GNNLSTMPolicyQ
+    gnnlstm_target_q,                # GNNLSTMPolicyQ (target)
+    optimizer: optim.Optimizer,
+    seq_batch,                       # (S_seq, A_seq, R_seq, NS_seq, D_seq)
+    graph_edge_index: torch.Tensor,  # [2,E]
+    gamma: float = 0.99,
+    double_dqn: bool = True,
+    burn_in: int = 8,
+    grad_clip: float = 1.0,
+) -> float:
+    """
+    CTDE-VDN with spatio-temporal Q:
+      - Inputs are **sequence windows**:
+          S_seq   : [B, L, N, O]
+          A_seq   : [B, L, N]
+          R_seq   : [B, L, N]
+          NS_seq  : [B, L, N, O]   (next-state aligned)
+          D_seq   : [B, L]
+        where L = burn_in + unroll_len.
+      - We compute losses only on the last `unroll_len` steps (mask out burn-in).
+      - VDN: Q_tot = sum_i Q_i
+      - Double-DQN targets across the sequence.
+    """
+    S, A, R, NS, D = seq_batch
+    B, L, N, O = S.shape
+
+    S_t  = torch.as_tensor(S,  device=device, dtype=torch.float32)
+    A_t  = torch.as_tensor(A,  device=device, dtype=torch.long)
+    R_t  = torch.as_tensor(R,  device=device, dtype=torch.float32)
+    NS_t = torch.as_tensor(NS, device=device, dtype=torch.float32)
+    D_t  = torch.as_tensor(D,  device=device, dtype=torch.float32)
+
+    # Forward over full window to warm hidden; mask out burn-in for the loss
+    q_seq, _ = gnnlstm_online_q(S_t, graph_edge_index.to(device), hidden=None)   # [B,L,N,A]
+    q_taken = q_seq.gather(-1, A_t.unsqueeze(-1)).squeeze(-1)                    # [B,L,N]
+    q_tot   = q_taken.sum(dim=-1)                                                # [B,L]
+
+    with torch.no_grad():
+        if double_dqn:
+            next_actions = _shift_next_actions_double_dqn(gnnlstm_online_q, NS_t, graph_edge_index.to(device))  # [B,L,N]
+        else:
+            tmp_q, _ = gnnlstm_target_q(NS_t, graph_edge_index.to(device), hidden=None)
+            next_actions = tmp_q.argmax(dim=-1).long()  # [B,L,N]
+
+        q_next_targ, _ = gnnlstm_target_q(NS_t, graph_edge_index.to(device), hidden=None)          # [B,L,N,A]
+        q_next_a = q_next_targ.gather(-1, next_actions.unsqueeze(-1)).squeeze(-1)                  # [B,L,N]
+        q_next_tot = q_next_a.sum(dim=-1)                                                          # [B,L]
+
+        R_team = R_t.sum(dim=-1)                                                                   # [B,L]
+        target = R_team + (1.0 - D_t) * gamma * q_next_tot                                         # [B,L]
+
+    # Mask out burn-in steps
+    if burn_in > 0:
+        mask = torch.zeros((B, L), device=device)
+        mask[:, burn_in:] = 1.0
+    else:
+        mask = torch.ones((B, L), device=device)
+
+    td = nn.functional.smooth_l1_loss(q_tot, target, reduction='none')   # [B,L]
+    loss = (td * mask).sum() / (mask.sum().clamp_min(1.0))
+
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(gnnlstm_online_q.parameters(), grad_clip)
+    optimizer.step()
+
+    return float(loss.item())
+
+# =============================== A2C update (MLP) =================================
+# GAE utilities
+def _compute_gae(
+    rewards: torch.Tensor,      # [T,N]
+    values: torch.Tensor,       # [T,N]
+    dones: torch.Tensor,        # [T]  (1.0 at terminal step, else 0.0)
+    next_value: torch.Tensor,   # [N]
+    gamma: float,
+    lam: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns (advantages, returns) each shape [T,N].
+    dones[t]=1 means terminal at step t (stop bootstrapping beyond t).
+    """
+    T, N = rewards.shape
+    adv = torch.zeros((T, N), device=rewards.device)
+    gae = torch.zeros((N,), device=rewards.device)
+    for t in reversed(range(T)):
+        nonterm = 1.0 - dones[t]           # scalar broadcast over N
+        v_next = next_value if t == T - 1 else values[t + 1]
+        delta = rewards[t] + gamma * nonterm * v_next - values[t]
+        gae = delta + gamma * lam * nonterm * gae
+        adv[t] = gae
+    ret = adv + values
+    return adv, ret
+
+def ia2c_update_mlp(
+    actor: nn.Module,                 # ActorMLP: obs -> logits[A]
+    critic: nn.Module,                # CriticMLP: obs -> value
+    optim_actor: torch.optim.Optimizer,
+    optim_critic: torch.optim.Optimizer,
+    obs_seq: torch.Tensor,            # [T,N,O]
+    act_seq: torch.Tensor,            # [T,N] (long)
+    rew_seq: torch.Tensor,            # [T,N] (float)
+    done_seq: torch.Tensor,           # [T]   (float; episode terminal flags)
+    last_obs: torch.Tensor,           # [N,O] (for bootstrap if not terminal)
+    gamma: float = 0.99,
+    gae_lambda: float = 0.95,
+    entropy_coef: float = 0.01,
+    value_coef: float = 0.5,
+    grad_clip: float = 1.0,
+    # stability knobs (no diagnostics, no repeats)
+    normalize_rewards: bool = True,
+    reward_scale: float = 1.0,
+    normalize_adv: bool = True,
+    huber_delta: float = 1.0,
+    value_clip_eps: float = 0.2,      # set 0 to disable clipping
+) -> dict:
+    """
+    One IA2C update with GAE(λ) for a single rollout (length T).
+    Adds: reward normalization, advantage normalization, Huber value loss,
+    and optional value clipping (A2C-style).
+    """
+    device = next(actor.parameters()).device
+    T, N, O = obs_seq.shape
+
+    # Flatten (T*N, O) once
+    obs_flat = obs_seq.reshape(T * N, O).to(device)
+    actions  = act_seq.to(device)
+    dones    = done_seq.to(device).float()
+    last_obs = last_obs.to(device)
+
+    # Forward passes
+    logits_flat = actor(obs_flat)                 # [T*N, A]
+    values_flat = critic(obs_flat)                # [T*N]
+    A_dim = logits_flat.size(-1)
+
+    logits = logits_flat.view(T, N, A_dim)       # [T,N,A]
+    values = values_flat.view(T, N)              # [T,N]
+
+    # Policy log-prob & entropy
+    dist = Categorical(logits=logits)            # broadcast over [T,N]
+    logp_taken = dist.log_prob(actions.long())   # [T,N]
+    entropy = dist.entropy().mean()
+
+    # Bootstrap value
+    with torch.no_grad():
+        if dones[-1] > 0.5:
+            next_value = torch.zeros((N,), device=device)
+        else:
+            next_value = critic(last_obs)        # [N]
+
+    # Reward normalization (across T*N), optional
+    rewards = rew_seq.to(device).float()
+    if normalize_rewards:
+        r_mean = rewards.mean()
+        r_std  = rewards.std(unbiased=False).clamp_min(1e-6)
+        rewards = reward_scale * (rewards - r_mean) / r_std
+
+    # GAE (on-device)
+    adv, ret = _compute_gae(
+        rewards=rewards,
+        values=values,
+        dones=dones,
+        next_value=next_value,
+        gamma=gamma,
+        lam=gae_lambda,
+    )  # [T,N] each
+
+    # Advantage normalization (over T*N), optional
+    if normalize_adv:
+        adv_flat = adv.reshape(-1)
+        adv = (adv - adv_flat.mean()) / (adv_flat.std(unbiased=False).clamp_min(1e-6))
+
+    # Losses
+    policy_loss = -(logp_taken * adv.detach()).mean()
+
+    # Value loss: Huber + optional value clipping (A2C-style)
+    v_pred   = values
+    v_target = ret.detach()
+    if value_clip_eps and value_clip_eps > 0.0:
+        v_clipped = v_pred + (v_target - v_pred).clamp(-value_clip_eps, value_clip_eps)
+        v_loss_unclipped = torch.nn.functional.smooth_l1_loss(v_pred,   v_target, reduction='mean', beta=huber_delta)
+        v_loss_clipped   = torch.nn.functional.smooth_l1_loss(v_clipped, v_target, reduction='mean', beta=huber_delta)
+        value_loss = torch.max(v_loss_unclipped, v_loss_clipped)
+    else:
+        value_loss = torch.nn.functional.smooth_l1_loss(v_pred, v_target, reduction='mean', beta=huber_delta)
+
+    total_loss = policy_loss - entropy_coef * entropy + value_coef * value_loss
+
+    # Optimize
+    optim_actor.zero_grad()
+    optim_critic.zero_grad()
+    total_loss.backward()
+    nn.utils.clip_grad_norm_(actor.parameters(), grad_clip)
+    nn.utils.clip_grad_norm_(critic.parameters(), grad_clip)
+    optim_actor.step()
+    optim_critic.step()
+
+    return {
+        "loss_total":  float(total_loss.item()),
+        "loss_policy": float(policy_loss.item()),
+        "loss_value":  float(value_loss.item()),
+        "entropy":     float(entropy.item()),
+    }
+
+# =============================== A2C update (LSTM) =================================
+def ia2c_update_lstm(
+    actor: ActorLSTM,
+    critic: CriticLSTM,
+    optim_actor: optim.Optimizer,
+    optim_critic: optim.Optimizer,
+    obs_seq: torch.Tensor,     # [T,N,O]
+    act_seq: torch.Tensor,     # [T,N] (long)
+    rew_seq: torch.Tensor,     # [T,N]
+    done_seq: torch.Tensor,    # [T]  (float; 1.0 terminal)
+    last_obs: torch.Tensor,    # [N,O] bootstrap
+    gamma: float,
+    gae_lambda: float,
+    entropy_coef: float,
+    value_coef: float,
+    grad_clip: float,
+    # optional stabilizers (match your MLP version)
+    normalize_rewards: bool = True,
+    reward_scale: float = 0.1,
+    normalize_adv: bool = True,
+    huber_delta: float = 1.0,
+    value_clip_eps: float = 0.2,
+) -> Dict[str, float]:
+
+    device = next(actor.parameters()).device
+    T, N, O = obs_seq.shape
+    obs_seq  = obs_seq.to(device)
+    act_seq  = act_seq.to(device).long()
+    rew_seq  = rew_seq.to(device)
+    done_seq = done_seq.to(device)
+    last_obs = last_obs.to(device)
+
+    # -------- TRAIN MODE for the forwards we backprop through --------
+    actor.train()
+    critic.train()
+
+    # -------- critic forward over the whole sequence (builds graph) --------
+    # CriticLSTM(...).forward should return (values_seq_batched, (h,c)) where
+    # values_seq_batched has shape [1, T, N] or [T, N] depending on your impl.
+    values_batched, _ = critic(obs_seq)     # no torch.no_grad() here
+    if values_batched.dim() == 3:
+        values_seq = values_batched[0]      # [T, N]
+    else:
+        values_seq = values_batched         # already [T, N]
+
+    # -------- bootstrap next value (no grad, eval ok) --------
+    with torch.no_grad():
+        critic.eval()
+        next_value, _ = critic.step(last_obs)     # [N]
+    critic.train()  # switch back for the losses/opt step
+
+    # -------- reward normalization / scaling (optional) --------
+    if normalize_rewards:
+        mean_r = rew_seq.mean()
+        std_r  = rew_seq.std(unbiased=False).clamp_min(1e-6)
+        rew_use = (rew_seq - mean_r) / std_r
+    else:
+        rew_use = rew_seq
+    if reward_scale is not None and reward_scale != 1.0:
+        rew_use = rew_use * reward_scale
+
+    # -------- GAE (no grad) --------
+    with torch.no_grad():
+        adv, ret = _compute_gae(
+            rewards=rew_use, values=values_seq, dones=done_seq,
+            next_value=next_value, gamma=gamma, lam=gae_lambda
+        )  # [T,N] each
+
+    # -------- actor forward for logits over the sequence (builds graph) --------
+    logits_batched, _ = actor(obs_seq)    # no torch.no_grad()
+    if logits_batched.dim() == 4:
+        logits_seq = logits_batched[0]    # [T, N, A]
+    else:
+        logits_seq = logits_batched       # already [T, N, A]
+
+    dist = Categorical(logits=logits_seq)
+    logp_taken = dist.log_prob(act_seq)         # [T,N]
+    entropy = dist.entropy().mean()
+
+    # -------- advantage normalization (over T*N) --------
+    if normalize_adv:
+        adv_flat = adv.view(-1)
+        adv = (adv - adv_flat.mean()) / (adv_flat.std(unbiased=False).clamp_min(1e-6))
+
+    # -------- losses --------
+    policy_loss = -(logp_taken * adv.detach()).mean()
+
+    # value loss with Huber + value clipping
+    with torch.no_grad():
+        old_values = values_seq.clone()
+    # clipped target around old values to stabilize critic
+    values_clipped = old_values + (values_seq - old_values).clamp(-value_clip_eps, value_clip_eps)
+    # Huber (smooth L1) on unclipped and clipped, take max like PPO value clipping
+    v_err_unclipped = ret.detach() - values_seq
+    v_err_clipped   = ret.detach() - values_clipped
+    value_loss_unclipped = torch.nn.functional.smooth_l1_loss(
+        values_seq, ret.detach(), beta=huber_delta
+    )
+    value_loss_clipped = torch.nn.functional.smooth_l1_loss(
+        values_clipped, ret.detach(), beta=huber_delta
+    )
+    value_loss = torch.max(value_loss_unclipped, value_loss_clipped)
+
+    loss_total = policy_loss + value_coef * value_loss - entropy_coef * entropy
+
+    # -------- optimize --------
+    optim_actor.zero_grad(set_to_none=True)
+    optim_critic.zero_grad(set_to_none=True)
+    loss_total.backward()
+    nn.utils.clip_grad_norm_(actor.parameters(), grad_clip)
+    nn.utils.clip_grad_norm_(critic.parameters(), grad_clip)
+    optim_actor.step()
+    optim_critic.step()
+
+    return {
+        "loss_total":  float(loss_total.item()),
+        "loss_policy": float(policy_loss.item()),
+        "loss_value":  float(value_loss.item()),
+        "entropy":     float(entropy.item()),
+    }
+
+# ================= A2C update (LSTM for actor, MLP for critic) ====================
+def ia2c_update_lstm_actor_mlp(
+    actor: nn.Module,                 # ActorLSTM: local seq [T,N,O] -> logits [T,N,A]
+    critic: nn.Module,                # CriticMLP: local obs [O]    -> value  [1]
+    optim_actor: torch.optim.Optimizer,
+    optim_critic: torch.optim.Optimizer,
+    obs_seq: torch.Tensor,            # [T, N, O]
+    act_seq: torch.Tensor,            # [T, N] (long)
+    rew_seq: torch.Tensor,            # [T, N] (float)
+    done_seq: torch.Tensor,           # [T]   (float; 1.0 if terminal at t)
+    last_obs: torch.Tensor,           # [N, O] local obs for bootstrap
+    gamma: float = 0.99,
+    gae_lambda: float = 0.95,
+    entropy_coef: float = 0.01,
+    value_coef: float = 0.5,
+    grad_clip: float = 1.0,
+    # stabilizers
+    normalize_rewards: bool = True,
+    reward_scale: float = 1.0,
+    normalize_adv: bool = True,
+    huber_delta: float = 1.0,
+    value_clip_eps: float = 0.2,      # 0 to disable clipping
+) -> dict:
+    """
+    IA2C update for one rollout using an LSTM actor (shared, decentralized)
+    and a per-agent MLP critic (shared). Computes *per-agent* GAE on local values.
+    """
+    device = next(actor.parameters()).device
+    T, N, O = obs_seq.shape
+
+    # Move to device
+    obs_seq  = obs_seq.to(device).float()     # [T,N,O]
+    actions  = act_seq.to(device).long()      # [T,N]
+    rewards  = rew_seq.to(device).float()     # [T,N]
+    dones    = done_seq.to(device).float()    # [T]
+    last_obs = last_obs.to(device).float()    # [N,O]
+
+    # ---------- Actor forward over the sequence ----------
+    # ActorLSTM.forward accepts [T,N,O] and returns [1,T,N,A]
+    logits_seq, _ = actor(obs_seq)            # [1,T,N,A]
+    logits = logits_seq[0]                    # [T,N,A]
+
+    dist       = Categorical(logits=logits)   # broadcast over [T,N]
+    logp_taken = dist.log_prob(actions)       # [T,N]
+    entropy    = dist.entropy().mean()
+
+    # ---------- Per-agent critic on LOCAL obs ----------
+    obs_flat     = obs_seq.reshape(T * N, O)     # [T*N,O]
+    values_flat  = critic(obs_flat)              # [T*N]
+    values       = values_flat.view(T, N)        # [T,N]
+
+    with torch.no_grad():
+        if dones[-1] > 0.5:
+            next_value = torch.zeros((N,), device=device)    # [N]
+        else:
+            next_value = critic(last_obs)                    # [N]
+
+    # ---------- Reward normalization (optional) ----------
+    if normalize_rewards:
+        r_mean = rewards.mean()
+        r_std  = rewards.std(unbiased=False).clamp_min(1e-6)
+        rewards = reward_scale * (rewards - r_mean) / r_std
+    elif reward_scale != 1.0:
+        rewards = reward_scale * rewards
+
+    # ---------- Per-agent GAE ----------
+    with torch.no_grad():
+        adv = torch.zeros_like(values)          # [T,N]
+        gae = torch.zeros((N,), device=device)  # [N]
+        for t in reversed(range(T)):
+            nonterm = (1.0 - dones[t])          # scalar
+            v_next  = next_value if t == T - 1 else values[t + 1]  # [N]
+            delta   = rewards[t] + gamma * nonterm * v_next - values[t]
+            gae     = delta + gamma * gae_lambda * nonterm * gae
+            adv[t]  = gae
+        ret = adv + values                       # [T,N]
+
+    # Advantage normalization (over all T*N), optional
+    if normalize_adv:
+        adv_flat = adv.reshape(-1)
+        adv = (adv - adv_flat.mean()) / (adv_flat.std(unbiased=False).clamp_min(1e-6))
+
+    # ---------- Losses ----------
+    policy_loss = -(logp_taken * adv.detach()).mean()
+
+    v_pred   = values
+    v_target = ret.detach()
+    if value_clip_eps and value_clip_eps > 0.0:
+        v_clipped        = v_pred + (v_target - v_pred).clamp(-value_clip_eps, value_clip_eps)
+        v_loss_unclipped = torch.nn.functional.smooth_l1_loss(v_pred,    v_target, reduction='mean', beta=huber_delta)
+        v_loss_clipped   = torch.nn.functional.smooth_l1_loss(v_clipped, v_target, reduction='mean', beta=huber_delta)
+        value_loss       = torch.max(v_loss_unclipped, v_loss_clipped)
+    else:
+        value_loss       = torch.nn.functional.smooth_l1_loss(v_pred, v_target, reduction='mean', beta=huber_delta)
+
+    total_loss = policy_loss - entropy_coef * entropy + value_coef * value_loss
+
+    # ---------- Optimize ----------
+    optim_actor.zero_grad(set_to_none=True)
+    optim_critic.zero_grad(set_to_none=True)
+    total_loss.backward()
+    nn.utils.clip_grad_norm_(actor.parameters(),  grad_clip)
+    nn.utils.clip_grad_norm_(critic.parameters(), grad_clip)
+    optim_actor.step()
+    optim_critic.step()
+
+    return {
+        "loss_total":  float(total_loss.item()),
+        "loss_policy": float(policy_loss.item()),
+        "loss_value":  float(value_loss.item()),
+        "entropy":     float(entropy.item()),
+        # (optional) some diagnostics:
+        # "value_mean":  float(values.mean().item()),
+        # "adv_mean":    float(adv.mean().item()),
+    }
+
+# ================= A2C update (MLP for actor, LSTM for critic) ====================
+def ia2c_update_mlp_actor_lstm_critic(
+    actor: nn.Module,                 # ActorMLP: local obs [O] -> logits [A]
+    critic: nn.Module,                # CriticLSTM: local seq [T,N,O] -> values [T,N]
+    optim_actor: torch.optim.Optimizer,
+    optim_critic: torch.optim.Optimizer,
+    obs_seq: torch.Tensor,            # [T, N, O]
+    act_seq: torch.Tensor,            # [T, N] (long)
+    rew_seq: torch.Tensor,            # [T, N] (float)
+    done_seq: torch.Tensor,           # [T]     (float; episode terminal flags)
+    last_obs: torch.Tensor,           # [N, O]  (for bootstrap if not terminal)
+    gamma: float = 0.99,
+    gae_lambda: float = 0.95,
+    entropy_coef: float = 0.01,
+    value_coef: float = 0.5,
+    grad_clip: float = 1.0,
+    # stability knobs
+    normalize_rewards: bool = True,
+    reward_scale: float = 1.0,
+    normalize_adv: bool = True,
+    huber_delta: float = 1.0,
+    value_clip_eps: float = 0.2,      # 0 to disable clipping
+) -> dict:
+    """
+    IA2C update for a single rollout using an MLP actor (shared, decentralized)
+    and an LSTM critic (shared, decentralized). Computes *per-agent* GAE on local values.
+    """
+    device = next(actor.parameters()).device
+    T, N, O = obs_seq.shape
+
+    # to device
+    obs_seq  = obs_seq.to(device).float()     # [T,N,O]
+    actions  = act_seq.to(device).long()      # [T,N]
+    rewards  = rew_seq.to(device).float()     # [T,N]
+    dones    = done_seq.to(device).float()    # [T]
+    last_obs = last_obs.to(device).float()    # [N,O]
+
+    # -------- Policy (MLP actor) --------
+    obs_flat    = obs_seq.reshape(T * N, O)   # [T*N,O]
+    logits_flat = actor(obs_flat)             # [T*N,A]
+    A_dim       = logits_flat.size(-1)
+    logits      = logits_flat.view(T, N, A_dim)  # [T,N,A]
+
+    dist       = Categorical(logits=logits)
+    logp_taken = dist.log_prob(actions)       # [T,N]
+    entropy    = dist.entropy().mean()
+
+    # -------- Value (LSTM critic) --------
+    # CriticLSTM.forward accepts [T,N,O] and returns [1,T,N]
+    values_bt, _ = critic(obs_seq)            # [1,T,N]
+    values = values_bt[0]                     # [T,N]
+
+    with torch.no_grad():
+        if dones[-1] > 0.5:
+            next_value = torch.zeros((N,), device=device)   # [N]
+        else:
+            last_vals_bt, _ = critic(last_obs)              # input [N,O] -> [1,1,N]
+            next_value = last_vals_bt[0, -1]                # [N]
+
+    # -------- Reward normalization / scaling --------
+    if normalize_rewards:
+        r_mean = rewards.mean()
+        r_std  = rewards.std(unbiased=False).clamp_min(1e-6)
+        rewards = reward_scale * (rewards - r_mean) / r_std
+    elif reward_scale != 1.0:
+        rewards = reward_scale * rewards
+
+    # -------- Per-agent GAE --------
+    with torch.no_grad():
+        adv = torch.zeros_like(values)          # [T,N]
+        gae = torch.zeros((N,), device=device)  # [N]
+        for t in reversed(range(T)):
+            nonterm = (1.0 - dones[t])          # scalar
+            v_next  = next_value if t == T - 1 else values[t + 1]  # [N]
+            delta   = rewards[t] + gamma * nonterm * v_next - values[t]
+            gae     = delta + gamma * gae_lambda * nonterm * gae
+            adv[t]  = gae
+        ret = adv + values                       # [T,N]
+
+    # Advantage normalization (over T*N), optional
+    if normalize_adv:
+        adv_flat = adv.reshape(-1)
+        adv = (adv - adv_flat.mean()) / (adv_flat.std(unbiased=False).clamp_min(1e-6))
+
+    # -------- Losses --------
+    policy_loss = -(logp_taken * adv.detach()).mean()
+
+    v_pred   = values
+    v_target = ret.detach()
+    if value_clip_eps and value_clip_eps > 0.0:
+        v_clipped        = v_pred + (v_target - v_pred).clamp(-value_clip_eps, value_clip_eps)
+        v_loss_unclipped = torch.nn.functional.smooth_l1_loss(v_pred,    v_target, reduction='mean', beta=huber_delta)
+        v_loss_clipped   = torch.nn.functional.smooth_l1_loss(v_clipped, v_target, reduction='mean', beta=huber_delta)
+        value_loss       = torch.max(v_loss_unclipped, v_loss_clipped)
+    else:
+        value_loss       = torch.nn.functional.smooth_l1_loss(v_pred, v_target, reduction='mean', beta=huber_delta)
+
+    total_loss = policy_loss - entropy_coef * entropy + value_coef * value_loss
+
+    # -------- Optimize --------
+    optim_actor.zero_grad(set_to_none=True)
+    optim_critic.zero_grad(set_to_none=True)
+    total_loss.backward()
+    nn.utils.clip_grad_norm_(actor.parameters(),  grad_clip)
+    nn.utils.clip_grad_norm_(critic.parameters(), grad_clip)
+    optim_actor.step()
+    optim_critic.step()
+
+    return {
+        "loss_total":  float(total_loss.item()),
+        "loss_policy": float(policy_loss.item()),
+        "loss_value":  float(value_loss.item()),
+        "entropy":     float(entropy.item()),
+    }
+
+# =============================== A2C update (GNN) =================================
+def ia2c_update_gnn_attn(
+    actor: nn.Module,                      # ActorGNNAttn: [N,O] -> [N,A] (with graph)
+    critic: nn.Module,                     # CriticGNNPerAgentAttn: [N,O] -> [N] (with graph)
+    optim_actor: torch.optim.Optimizer,
+    optim_critic: torch.optim.Optimizer,
+    obs_seq: torch.Tensor,                 # [T, N, O]
+    act_seq: torch.Tensor,                 # [T, N]  (long)
+    rew_seq: torch.Tensor,                 # [T, N]  (float)
+    done_seq: torch.Tensor,                # [T]     (float 0/1)
+    last_obs: torch.Tensor,                # [N, O]  (for bootstrap if not terminal)
+    edge_index: torch.Tensor,              # [2, E]  (torch.long)
+    edge_attr: Optional[torch.Tensor] = None,  # [E, D_e] or None
+    gamma: float = 0.97,
+    gae_lambda: float = 0.90,
+    entropy_coef: float = 0.02,
+    value_coef: float = 0.25,
+    grad_clip: float = 1.0,
+    # stabilizers
+    normalize_rewards: bool = True,
+    reward_scale: float = 1.0,
+    normalize_adv: bool = True,
+    huber_delta: float = 1.0,
+    value_clip_eps: float = 0.2,           # set 0 to disable clipping
+) -> dict:
+    """
+    IA2C with attention-GNN actor (per-agent policy) and per-agent attention-GNN critic.
+    - Computes per-agent GAE on critic values V_i(o_i, neighbors)
+    - No dropout anywhere
+    """
+    device = next(actor.parameters()).device
+    T, N, O = obs_seq.shape
+
+    obs_seq  = obs_seq.to(device).float()     # [T,N,O]
+    acts     = act_seq.to(device).long()      # [T,N]
+    rewards  = rew_seq.to(device).float()     # [T,N]
+    dones    = done_seq.to(device).float()    # [T]
+    last_obs = last_obs.to(device).float()    # [N,O]
+
+    edge_index = edge_index.to(device)
+    if edge_attr is not None:
+        edge_attr = edge_attr.to(device)
+
+    # -------- Forward through actor & critic per time-step (keeps code simple/readable) --------
+    logits_list = []
+    v_list      = []
+
+    for t in range(T):
+        X_t = obs_seq[t]                                      # [N,O]
+        logits_t = actor(X_t, edge_index, edge_attr)          # [N,A]
+        v_t      = critic(X_t, edge_index, edge_attr)         # [N]
+        logits_list.append(logits_t)
+        v_list.append(v_t)
+
+    logits_seq = torch.stack(logits_list, dim=0)              # [T,N,A]
+    v_seq      = torch.stack(v_list, dim=0)                   # [T,N]
+
+    dist       = Categorical(logits=logits_seq)
+    logp_taken = dist.log_prob(acts)                          # [T,N]
+    entropy    = dist.entropy().mean()
+
+    # Bootstrap per-agent values at the end
+    with torch.no_grad():
+        if dones[-1] > 0.5:
+            next_value = torch.zeros((N,), device=device)
+        else:
+            next_value = critic(last_obs, edge_index, edge_attr)  # [N]
+
+    # -------- Reward normalization (over T*N), optional --------
+    r = rewards
+    if normalize_rewards:
+        r_mean = r.mean()
+        r_std  = r.std(unbiased=False).clamp_min(1e-6)
+        r = reward_scale * (r - r_mean) / r_std
+    elif reward_scale != 1.0:
+        r = reward_scale * r
+
+    # -------- Per-agent GAE (vectorized over agents) --------
+    # v_seq: [T,N], r: [T,N], dones: [T], next_value: [N]
+    with torch.no_grad():
+        adv = torch.zeros_like(v_seq)          # [T,N]
+        gae = torch.zeros((N,), device=device) # [N]
+        for t in reversed(range(T)):
+            nonterm = 1.0 - dones[t]
+            v_next  = next_value if t == T - 1 else v_seq[t + 1]        # [N]
+            delta   = r[t] + gamma * nonterm * v_next - v_seq[t]        # [N]
+            gae     = delta + gamma * gae_lambda * nonterm * gae        # [N]
+            adv[t]  = gae
+        ret = adv + v_seq                                               # [T,N]
+
+    # Advantage normalization (global over T*N), optional
+    if normalize_adv:
+        adv_flat = adv.reshape(-1)
+        adv = (adv - adv_flat.mean()) / (adv_flat.std(unbiased=False).clamp_min(1e-6))
+
+    # -------- Losses --------
+    policy_loss = -(logp_taken * adv.detach()).mean()
+
+    # Value loss: Huber + optional value clipping (A2C-style), per-agent
+    v_pred   = v_seq
+    v_target = ret.detach()
+
+    if value_clip_eps and value_clip_eps > 0.0:
+        v_old = v_pred.detach()
+        v_clipped = v_old + (v_pred - v_old).clamp(-value_clip_eps, value_clip_eps)
+        v_loss_unclipped = torch.nn.functional.smooth_l1_loss(v_pred,   v_target, reduction='mean', beta=huber_delta)
+        v_loss_clipped   = torch.nn.functional.smooth_l1_loss(v_clipped, v_target, reduction='mean', beta=huber_delta)
+        value_loss = torch.max(v_loss_unclipped, v_loss_clipped)
+    else:
+        value_loss = torch.nn.functional.smooth_l1_loss(v_pred, v_target, reduction='mean', beta=huber_delta)
+
+    total_loss = policy_loss - entropy_coef * entropy + value_coef * value_loss
+
+    # -------- Optimize --------
+    optim_actor.zero_grad()
+    optim_critic.zero_grad()
+    total_loss.backward()
+    nn.utils.clip_grad_norm_(actor.parameters(),  grad_clip)
+    nn.utils.clip_grad_norm_(critic.parameters(), grad_clip)
+    optim_actor.step()
+    optim_critic.step()
+
+    return {
+        "loss_total":  float(total_loss.item()),
+        "loss_policy": float(policy_loss.item()),
+        "loss_value":  float(value_loss.item()),
+        "entropy":     float(entropy.item()),
+    }
+
+# =============================== A2C update (GNN+LSTM) =================================
+def ia2c_update_gnn_lstm_attn(
+    actor: nn.Module,                      # ActorGNNLSTMAttn
+    critic: nn.Module,                     # CriticGNNPerAgentLSTMAttn
+    optim_actor: torch.optim.Optimizer,
+    optim_critic: torch.optim.Optimizer,
+    obs_seq: torch.Tensor,                 # [T,N,O]
+    act_seq: torch.Tensor,                 # [T,N] (long)
+    rew_seq: torch.Tensor,                 # [T,N] (float)
+    done_seq: torch.Tensor,                # [T]   (float 0/1)
+    last_obs: torch.Tensor,                # [N,O] (for bootstrap if not terminal)
+    edge_index: torch.Tensor,              # [2,E] (long)
+    edge_attr: Optional[torch.Tensor] = None,
+    gamma: float = 0.97,
+    gae_lambda: float = 0.90,
+    entropy_coef: float = 0.02,
+    value_coef: float = 0.25,
+    grad_clip: float = 1.0,
+    # stabilisers
+    normalize_rewards: bool = True,
+    reward_scale: float = 1.0,
+    normalize_adv: bool = True,
+    huber_delta: float = 1.0,
+    value_clip_eps: float = 0.2,           # set 0 to disable clipping
+) -> Dict[str, float]:
+
+    device = next(actor.parameters()).device
+    T, N, O = obs_seq.shape
+
+    obs_seq  = obs_seq.to(device).float()      # [T,N,O]
+    acts     = act_seq.to(device).long()       # [T,N]
+    rewards  = rew_seq.to(device).float()      # [T,N]
+    dones    = done_seq.to(device).float()     # [T]
+    last_obs = last_obs.to(device).float()     # [N,O]
+
+    edge_index = edge_index.to(device)
+    if edge_attr is not None:
+        edge_attr = edge_attr.to(device)
+
+    # -------- Forward pass with LSTM memory across time --------
+    actor.train(); critic.train()
+    logits_seq, _ = actor(obs_seq, edge_index, edge_attr, hidden=None)   # [T,N,A]
+    v_seq,     _  = critic(obs_seq, edge_index, edge_attr, hidden=None)  # [T,N]
+
+    dist       = Categorical(logits=logits_seq)
+    logp_taken = dist.log_prob(acts)                                     # [T,N]
+    entropy    = dist.entropy().mean()
+
+    # -------- Bootstrap using critic at last_obs (respect terminal) --------
+    with torch.no_grad():
+        if dones[-1] > 0.5:
+            next_value = torch.zeros((N,), device=device)
+        else:
+            v_last, _ = critic(last_obs, edge_index, edge_attr, hidden=None)  # [N]
+            next_value = v_last
+
+    # -------- Reward normalisation (global over T*N), optional --------
+    r = rewards
+    if normalize_rewards:
+        r_mean = r.mean()
+        r_std  = r.std(unbiased=False).clamp_min(1e-6)
+        r = reward_scale * (r - r_mean) / r_std
+    elif reward_scale != 1.0:
+        r = reward_scale * r
+
+    # -------- Inlined per-agent GAE and returns --------
+    with torch.no_grad():
+        adv = torch.zeros_like(v_seq)                      # [T,N]
+        gae = torch.zeros((N,), device=device)             # [N]
+        for t in reversed(range(T)):
+            nonterm = 1.0 - dones[t]                       # []
+            v_next  = next_value if t == T - 1 else v_seq[t + 1]  # [N]
+            delta   = r[t] + gamma * nonterm * v_next - v_seq[t]  # [N]
+            gae     = delta + gamma * gae_lambda * nonterm * gae  # [N]
+            adv[t]  = gae
+        ret = adv + v_seq                                   # [T,N]
+
+    # Advantage normalisation (global)
+    if normalize_adv:
+        adv_flat = adv.view(-1)
+        adv = (adv - adv_flat.mean()) / (adv_flat.std(unbiased=False).clamp_min(1e-6))
+
+    # -------- Losses --------
+    policy_loss = -(logp_taken * adv.detach()).mean()
+
+    if value_clip_eps and value_clip_eps > 0.0:
+        v_old = v_seq.detach()
+        v_clipped = v_old + (v_seq - v_old).clamp(-value_clip_eps, value_clip_eps)
+        v_loss_unclipped = nn.functional.smooth_l1_loss(v_seq,     ret.detach(), reduction='mean', beta=huber_delta)
+        v_loss_clipped   = nn.functional.smooth_l1_loss(v_clipped, ret.detach(), reduction='mean', beta=huber_delta)
+        value_loss = torch.max(v_loss_unclipped, v_loss_clipped)
+    else:
+        value_loss = nn.functional.smooth_l1_loss(v_seq, ret.detach(), reduction='mean', beta=huber_delta)
+
+    total_loss = policy_loss - entropy_coef * entropy + value_coef * value_loss
+
+    # -------- Optimise --------
+    optim_actor.zero_grad()
+    optim_critic.zero_grad()
+    total_loss.backward()
+    nn.utils.clip_grad_norm_(actor.parameters(),  grad_clip)
+    nn.utils.clip_grad_norm_(critic.parameters(), grad_clip)
+    optim_actor.step()
+    optim_critic.step()
+
+    return {
+        "loss_total":  float(total_loss.item()),
+        "loss_policy": float(policy_loss.item()),
+        "loss_value":  float(value_loss.item()),
+        "entropy":     float(entropy.item()),
+    }
+
+# ============ MA2C-PA updater (MLP, vectorized GAE over agents)=================
+def ma2c_pa_update_mlp(
+    actor: nn.Module,                  # ActorMLP: [O] -> logits [A]
+    critic_pa: nn.Module,              # CriticPAMLP: [N*O] -> values [N]
+    optim_actor: torch.optim.Optimizer,
+    optim_critic: torch.optim.Optimizer,
+    obs_seq: torch.Tensor,             # [T, N, O]  (local)
+    act_seq: torch.Tensor,             # [T, N]     (long)
+    rew_seq: torch.Tensor,             # [T, N]     (per-agent rewards)
+    done_seq: torch.Tensor,            # [T]        (float; 1 if terminal at t)
+    last_obs: torch.Tensor,            # [N, O]
+    gamma: float = 0.99,
+    gae_lambda: float = 0.95,
+    entropy_coef: float = 0.01,
+    value_coef: float = 0.5,
+    grad_clip: float = 1.0,
+    # Reward handling
+    advantage_mode: str = "per_agent",         # {"per_agent","team"}
+    team_reward_reduce: str = "mean",          # {"mean","sum"} (used when advantage_mode="team")
+    normalize_rewards: str = "per_agent",      # {"off","per_agent","global"}
+    reward_scale: float = 1.0,                 # applied only if normalize_rewards != "off"
+    # Advantage/value stabilizers
+    normalize_adv: bool = True,
+    huber_delta: float = 1.0,
+    value_clip_eps: float = 0.2,
+) -> dict:
+    """
+    MA2C-PA: shared actor; centralized critic outputs a value per agent (N heads).
+    - If advantage_mode=="per_agent": GAE uses each agent's own reward r_i and V_i(s).
+    - If advantage_mode=="team": build r_team (mean/sum) and broadcast it to all agents,
+      but still use per-agent baselines V_i(s) (lower variance than scalar baseline).
+    - Rewards can be normalized per-agent across time or globally across T*N.
+    """
+    device = next(actor.parameters()).device
+    T, N, O = obs_seq.shape
+
+    # ---- To device / shapes ----
+    obs_seq  = obs_seq.to(device).float()      # [T,N,O]
+    acts     = act_seq.to(device).long()       # [T,N]
+    dones    = done_seq.to(device).float()     # [T]
+    rews     = rew_seq.to(device).float()      # [T,N]
+    last_obs = last_obs.to(device).float()     # [N,O]
+
+    # ---- Actor forward on local obs (for log-probs) ----
+    obs_flat    = obs_seq.reshape(T * N, O)            # [T*N,O]
+    logits_flat = actor(obs_flat)                      # [T*N,A]
+    A_dim       = logits_flat.size(-1)
+    logits      = logits_flat.view(T, N, A_dim)        # [T,N,A]
+    dist        = Categorical(logits=logits)
+    logp_taken  = dist.log_prob(acts)                  # [T,N]
+    entropy     = dist.entropy().mean()
+
+    # ---- Centralized per-agent values on joint obs ----
+    joint_seq = obs_seq.reshape(T, N * O)              # [T, N*O]
+    v_seq     = critic_pa(joint_seq)                   # [T, N]
+    with torch.no_grad():
+        v_last = critic_pa(last_obs.reshape(1, -1))[0] # [N]
+        # If the last step was terminal due to time-limit we already have done_seq[-1]=1 in the trainer.
+        # Still, for generality:
+        if dones[-1] > 0.5:
+            v_last = torch.zeros_like(v_last)
+
+    # ---- Choose reward matrix used for GAE ----
+    if advantage_mode == "per_agent":
+        r_mat = rews.clone()                           # [T,N]
+    elif advantage_mode == "team":
+        if team_reward_reduce == "mean":
+            r_team = rews.mean(dim=-1, keepdim=True)   # [T,1]
+        elif team_reward_reduce == "sum":
+            r_team = rews.sum(dim=-1, keepdim=True)    # [T,1]
+        else:
+            raise ValueError("team_reward_reduce must be 'mean' or 'sum'")
+        r_mat = r_team.expand(T, N)                    # [T,N]
+    else:
+        raise ValueError("advantage_mode must be 'per_agent' or 'team'")
+
+    # ---- Reward normalization (optional) ----
+    if normalize_rewards != "off":
+        if normalize_rewards == "per_agent":
+            mean = r_mat.mean(dim=0, keepdim=True)                     # [1,N]
+            std  = r_mat.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
+            r_mat = reward_scale * (r_mat - mean) / std
+        elif normalize_rewards == "global":
+            mean = r_mat.mean()
+            std  = r_mat.std(unbiased=False).clamp_min(1e-6)
+            r_mat = reward_scale * (r_mat - mean) / std
+        else:
+            raise ValueError("normalize_rewards must be {'off','per_agent','global'}")
+
+    # ---- Vectorized GAE over agents ----
+    with torch.no_grad():
+        adv = torch.zeros_like(v_seq)                  # [T,N]
+        gae = torch.zeros((N,), device=device)         # [N]
+        for t in reversed(range(T)):
+            nonterm = 1.0 - dones[t]                  # scalar
+            v_next  = v_last if t == T - 1 else v_seq[t + 1]  # [N]
+            delta   = r_mat[t] + gamma * nonterm * v_next - v_seq[t]  # [N]
+            gae     = delta + gamma * gae_lambda * nonterm * gae      # [N]
+            adv[t]  = gae                                             # [N]
+        ret = adv + v_seq                                             # [T,N]
+
+    # ---- Advantage normalization (global over T*N), optional ----
+    if normalize_adv:
+        flat = adv.reshape(-1)
+        adv = (adv - flat.mean()) / (flat.std(unbiased=False).clamp_min(1e-6))
+
+    # ---- Losses ----
+    policy_loss = -(logp_taken * adv.detach()).mean()
+
+    v_pred   = v_seq
+    v_target = ret.detach()
+
+    if value_clip_eps and value_clip_eps > 0.0:
+        v_clipped = v_pred + (v_target - v_pred).clamp(-value_clip_eps, value_clip_eps)
+        v_loss_unclipped = nn.functional.smooth_l1_loss(
+            v_pred, v_target, reduction="mean", beta=huber_delta
+        )
+        v_loss_clipped   = nn.functional.smooth_l1_loss(
+            v_clipped, v_target, reduction="mean", beta=huber_delta
+        )
+        value_loss = torch.max(v_loss_unclipped, v_loss_clipped)
+    else:
+        value_loss = nn.functional.smooth_l1_loss(
+            v_pred, v_target, reduction="mean", beta=huber_delta
+        )
+
+    total_loss = policy_loss - entropy_coef * entropy + value_coef * value_loss
+
+    # ---- Optimize ----
+    optim_actor.zero_grad(set_to_none=True)
+    optim_critic.zero_grad(set_to_none=True)
+    total_loss.backward()
+    nn.utils.clip_grad_norm_(actor.parameters(),  grad_clip)
+    nn.utils.clip_grad_norm_(critic_pa.parameters(), grad_clip)
+    optim_actor.step()
+    optim_critic.step()
+
+    return {
+        "loss_total":  float(total_loss.item()),
+        "loss_policy": float(policy_loss.item()),
+        "loss_value":  float(value_loss.item()),
+        "entropy":     float(entropy.item()),
+        "adv_mean":    float(adv.mean().item()),
+        "v_mean":      float(v_seq.mean().item()),
+    }
+
+# ============================ MA2C-PA updater (LSTM)=======================
+def ma2c_pa_update_lstm(
+    actor: nn.Module,                  # ActorLSTM: [T,N,O] -> logits [1,T,N,A]
+    critic_pa: nn.Module,              # CriticPALSTM: [T,N,O] -> values [1,T,N]
+    optim_actor: torch.optim.Optimizer,
+    optim_critic: torch.optim.Optimizer,
+    obs_seq: torch.Tensor,             # [T, N, O]  (local)
+    act_seq: torch.Tensor,             # [T, N]     (long)
+    rew_seq: torch.Tensor,             # [T, N]     (per-agent rewards)
+    done_seq: torch.Tensor,            # [T]        (float; 1 if terminal at t)
+    last_obs: torch.Tensor,            # [N, O]
+    gamma: float = 0.99,
+    gae_lambda: float = 0.95,
+    entropy_coef: float = 0.01,
+    value_coef: float = 0.5,
+    grad_clip: float = 1.0,
+    # Reward handling
+    advantage_mode: str = "per_agent",         # {"per_agent","team"}
+    team_reward_reduce: str = "mean",          # {"mean","sum"} (used when advantage_mode="team")
+    normalize_rewards: str = "per_agent",      # {"off","per_agent","global"}
+    reward_scale: float = 1.0,
+    # Advantage/value stabilisers
+    normalize_adv: bool = True,
+    huber_delta: float = 1.0,
+    value_clip_eps: float = 0.2,
+) -> Dict[str, float]:
+
+    device = next(actor.parameters()).device
+    T, N, O = obs_seq.shape
+
+    # ---- To device ----
+    obs_seq  = obs_seq.to(device).float()      # [T,N,O]
+    acts     = act_seq.to(device).long()       # [T,N]
+    dones    = done_seq.to(device).float()     # [T]
+    rews     = rew_seq.to(device).float()      # [T,N]
+    last_obs = last_obs.to(device).float()     # [N,O]
+
+    # ---- Actor forward on local obs (sequence) ----
+    logits_btna, _ = actor(obs_seq, hidden=None)          # [1,T,N,A]
+    logits_tna = logits_btna[0]                           # [T,N,A]
+    dist       = Categorical(logits=logits_tna)
+    logp_taken = dist.log_prob(acts)                      # [T,N]
+    entropy    = dist.entropy().mean()
+
+    # ---- Centralised per-agent values on joint obs (sequence + last) ----
+    v_btn, _ = critic_pa(obs_seq, hidden=None)            # [1,T,N]
+    v_seq = v_btn[0]                                      # [T,N]
+    with torch.no_grad():
+        v_last, _ = critic_pa.step(last_obs, hidden=None) # [N]
+        if dones[-1] > 0.5:
+            v_last = torch.zeros_like(v_last)
+
+    # ---- Choose reward matrix for GAE ----
+    if advantage_mode == "per_agent":
+        r_mat = rews.clone()                               # [T,N]
+    elif advantage_mode == "team":
+        if team_reward_reduce == "mean":
+            r_team = rews.mean(dim=-1, keepdim=True)       # [T,1]
+        elif team_reward_reduce == "sum":
+            r_team = rews.sum(dim=-1, keepdim=True)        # [T,1]
+        else:
+            raise ValueError("team_reward_reduce must be 'mean' or 'sum'")
+        r_mat = r_team.expand(T, N)                        # [T,N]
+    else:
+        raise ValueError("advantage_mode must be 'per_agent' or 'team'")
+
+    # ---- Reward normalisation (optional) ----
+    if normalize_rewards != "off":
+        if normalize_rewards == "per_agent":
+            mean = r_mat.mean(dim=0, keepdim=True)         # [1,N]
+            std  = r_mat.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
+            r_mat = reward_scale * (r_mat - mean) / std
+        elif normalize_rewards == "global":
+            mean = r_mat.mean()
+            std  = r_mat.std(unbiased=False).clamp_min(1e-6)
+            r_mat = reward_scale * (r_mat - mean) / std
+        else:
+            raise ValueError("normalize_rewards ∈ {'off','per_agent','global'}")
+
+    # ---- Vectorised per-agent GAE over time ----
+    with torch.no_grad():
+        adv = torch.zeros_like(v_seq)                      # [T,N]
+        gae = torch.zeros((N,), device=device)             # [N]
+        for t in reversed(range(T)):
+            nonterm = 1.0 - dones[t]
+            v_next  = v_last if t == T - 1 else v_seq[t + 1]
+            delta   = r_mat[t] + gamma * nonterm * v_next - v_seq[t]
+            gae     = delta + gamma * gae_lambda * nonterm * gae
+            adv[t]  = gae
+        ret = adv + v_seq                                  # [T,N]
+
+    # ---- Advantage normalisation (global over T*N) ----
+    if normalize_adv:
+        flat = adv.reshape(-1)
+        adv = (adv - flat.mean()) / (flat.std(unbiased=False).clamp_min(1e-6))
+
+    # ---- Losses ----
+    policy_loss = -(logp_taken * adv.detach()).mean()
+
+    v_pred   = v_seq
+    v_target = ret.detach()
+
+    if value_clip_eps and value_clip_eps > 0.0:
+        v_old = v_pred.detach()
+        v_clipped = v_old + (v_pred - v_old).clamp(-value_clip_eps, value_clip_eps)
+        v_loss_unclipped = nn.functional.smooth_l1_loss(v_pred,     v_target, reduction="mean", beta=huber_delta)
+        v_loss_clipped   = nn.functional.smooth_l1_loss(v_clipped,  v_target, reduction="mean", beta=huber_delta)
+        value_loss = torch.max(v_loss_unclipped, v_loss_clipped)
+    else:
+        value_loss = nn.functional.smooth_l1_loss(v_pred, v_target, reduction="mean", beta=huber_delta)
+
+    total_loss = policy_loss - entropy_coef * entropy + value_coef * value_loss
+
+    # ---- Optimise ----
+    optim_actor.zero_grad(set_to_none=True)
+    optim_critic.zero_grad(set_to_none=True)
+    total_loss.backward()
+    nn.utils.clip_grad_norm_(actor.parameters(),     grad_clip)
+    nn.utils.clip_grad_norm_(critic_pa.parameters(), grad_clip)
+    optim_actor.step()
+    optim_critic.step()
+
+    return {
+        "loss_total":  float(total_loss.item()),
+        "loss_policy": float(policy_loss.item()),
+        "loss_value":  float(value_loss.item()),
+        "entropy":     float(entropy.item()),
+        "adv_mean":    float(adv.mean().item()),
+        "v_mean":      float(v_seq.mean().item()),
+    }
+
+# # =============================== MA2C update (MLP) ================================
+# def ma2c_update_mlp(
+#     actor: nn.Module,                 # ActorMLP: local obs [O] -> logits [A]
+#     critic: nn.Module,                # CriticMLP: joint obs [N*O] -> scalar value
+#     optim_actor: torch.optim.Optimizer,
+#     optim_critic: torch.optim.Optimizer,
+#     obs_seq: torch.Tensor,            # [T,N,O]
+#     act_seq: torch.Tensor,            # [T,N] (long)
+#     rew_seq: torch.Tensor,            # [T,N] (float; per-agent rewards)
+#     done_seq: torch.Tensor,           # [T]   (float; episode terminal flags)
+#     last_obs: torch.Tensor,           # [N,O] (for bootstrap if not terminal)
+#     gamma: float = 0.99,
+#     gae_lambda: float = 0.95,
+#     entropy_coef: float = 0.01,
+#     value_coef: float = 0.5,
+#     grad_clip: float = 1.0,
+#     # stability knobs (match IA2C style)
+#     normalize_rewards: bool = True,
+#     reward_scale: float = 1.0,
+#     normalize_adv: bool = True,
+#     huber_delta: float = 1.0,
+#     value_clip_eps: float = 0.2,      # set 0 to disable clipping
+#     # team reward aggregation
+#     team_reward_reduce: str = "mean", # "mean" | "sum"
+# ) -> dict:
+#     """
+#     One MA2C update with GAE(λ) for a single rollout (length T).
+#     - Shared decentralized actor uses local obs; centralized critic uses joint obs.
+#     - Per-step team reward is aggregated from per-agent rewards (mean/sum).
+#     - Scalar GAE is computed on the team signal and broadcast to all agents.
+#     - Adds: reward normalization, advantage normalization, Huber value loss,
+#       and optional value clipping (A2C-style), mirroring your IA2C updater.
+#     """
+#     device = next(actor.parameters()).device
+#     T, N, O = obs_seq.shape
+#
+#     # Tensors to device
+#     obs_seq  = obs_seq.to(device).float()
+#     actions  = act_seq.to(device).long()
+#     dones    = done_seq.to(device).float()
+#     last_obs = last_obs.to(device).float()
+#     rewards  = rew_seq.to(device).float()  # [T,N]
+#
+#     # -------- Actor forward on local obs --------
+#     obs_flat    = obs_seq.reshape(T * N, O)          # [T*N, O]
+#     logits_flat = actor(obs_flat)                    # [T*N, A]
+#     A_dim       = logits_flat.size(-1)
+#     logits      = logits_flat.view(T, N, A_dim)      # [T,N,A]
+#
+#     dist        = Categorical(logits=logits)         # over [T,N]
+#     logp_taken  = dist.log_prob(actions)             # [T,N]
+#     entropy     = dist.entropy().mean()
+#
+#     # -------- Centralized critic on JOINT obs --------
+#     joint_seq = obs_seq.reshape(T, N * O)            # [T, N*O]
+#     v_seq     = critic(joint_seq).reshape(-1)        # [T]
+#     with torch.no_grad():
+#         if dones[-1] > 0.5:
+#             next_value = torch.zeros((), device=device)
+#         else:
+#             next_value = critic(last_obs.reshape(1, -1)).reshape(-1)[0]  # []
+#
+#     # -------- Team reward aggregation --------
+#     if team_reward_reduce == "mean":
+#         r_team = rewards.mean(dim=-1)                # [T]
+#     elif team_reward_reduce == "sum":
+#         r_team = rewards.sum(dim=-1)                 # [T]
+#     else:
+#         raise ValueError("team_reward_reduce must be 'mean' or 'sum'")
+#
+#     # print(f"[update] r_team mean={r_team.mean().item():.3f} std={r_team.std(unbiased=False).item():.3f}")
+#
+#     # Reward normalization (over T), optional — matches IA2C style (includes reward_scale here)
+#     if normalize_rewards:
+#         r_mean = r_team.mean()
+#         r_std  = r_team.std(unbiased=False).clamp_min(1e-6)
+#         r_team = reward_scale * (r_team - r_mean) / r_std
+#
+#     # -------- Scalar GAE on team signal --------
+#     with torch.no_grad():
+#         adv = torch.zeros_like(v_seq)                # [T]
+#         gae = torch.zeros((), device=device)
+#         for t in reversed(range(T)):
+#             nonterm = 1.0 - dones[t]
+#             v_next  = next_value if t == T - 1 else v_seq[t + 1]
+#             delta   = r_team[t] + gamma * nonterm * v_next - v_seq[t]
+#             gae     = delta + gamma * gae_lambda * nonterm * gae
+#             adv[t]  = gae
+#         ret = adv + v_seq                            # [T]
+#
+#     # Advantage normalization (over T), optional
+#     if normalize_adv:
+#         adv = (adv - adv.mean()) / (adv.std(unbiased=False).clamp_min(1e-6))
+#
+#     # -------- Losses --------
+#     # Broadcast scalar adv to all agents at each t
+#     adv_broadcast = adv.unsqueeze(-1).expand(T, N)   # [T,N]
+#     policy_loss   = -(logp_taken * adv_broadcast.detach()).mean()
+#
+#     # Value loss: Huber + optional value clipping (A2C-style)
+#     v_pred   = v_seq
+#     v_target = ret.detach()
+#     if value_clip_eps and value_clip_eps > 0.0:
+#         v_clipped = v_pred + (v_target - v_pred).clamp(-value_clip_eps, value_clip_eps)
+#         v_loss_unclipped = torch.nn.functional.smooth_l1_loss(v_pred,   v_target, reduction='mean', beta=huber_delta)
+#         v_loss_clipped   = torch.nn.functional.smooth_l1_loss(v_clipped, v_target, reduction='mean', beta=huber_delta)
+#         value_loss = torch.max(v_loss_unclipped, v_loss_clipped)
+#     else:
+#         value_loss = torch.nn.functional.smooth_l1_loss(v_pred, v_target, reduction='mean', beta=huber_delta)
+#
+#     total_loss = policy_loss - entropy_coef * entropy + value_coef * value_loss
+#
+#     # -------- Optimize --------
+#     optim_actor.zero_grad()
+#     optim_critic.zero_grad()
+#     total_loss.backward()
+#     nn.utils.clip_grad_norm_(actor.parameters(),  grad_clip)
+#     nn.utils.clip_grad_norm_(critic.parameters(), grad_clip)
+#     optim_actor.step()
+#     optim_critic.step()
+#
+#     return {
+#         "loss_total":  float(total_loss.item()),
+#         "loss_policy": float(policy_loss.item()),
+#         "loss_value":  float(value_loss.item()),
+#         "entropy":     float(entropy.item()),
+#     }
+
+# # =============================== MA2C update (LSTM) ================================
+# def ma2c_update_lstm(
+#     actor: nn.Module,                 # ActorLSTM: local obs [T,N,O] -> logits [T,N,A]
+#     critic: nn.Module,                # CriticMLP: joint obs [N*O]  -> scalar V
+#     optim_actor: torch.optim.Optimizer,
+#     optim_critic: torch.optim.Optimizer,
+#     obs_seq: torch.Tensor,            # [T, N, O]  local observations
+#     act_seq: torch.Tensor,            # [T, N]     actions (long)
+#     rew_seq: torch.Tensor,            # [T, N]     per-agent rewards
+#     done_seq: torch.Tensor,           # [T]        1.0 if episode terminal at step t, else 0.0
+#     last_obs: torch.Tensor,           # [N, O]     final joint obs for bootstrap (critic)
+#     gamma: float = 0.97,
+#     gae_lambda: float = 0.90,
+#     entropy_coef: float = 0.02,
+#     value_coef: float = 0.25,
+#     grad_clip: float = 0.5,
+#     normalize_adv: bool = True,
+#     normalize_rewards: bool = True,
+#     reward_scale: float = 0.1,
+#     huber_delta: float = 1.0,
+#     value_clip_eps: float = 0.2,
+#     team_reward_reduce: str = "mean",  # "mean" | "sum"
+# ) -> dict:
+#     """
+#     MA2C update (centralized critic, decentralized LSTM actor) for one rollout.
+#     - Team reward can be MEAN or SUM over agents (configurable).
+#     - Rewards/advantages can be normalized.
+#     - Value loss uses Huber + optional PPO-style value clipping.
+#     """
+#     device = next(actor.parameters()).device
+#     obs_seq  = obs_seq.to(device)
+#     act_seq  = act_seq.to(device).long()
+#     rew_seq  = rew_seq.to(device).float()
+#     done_seq = done_seq.to(device).float()
+#     last_obs = last_obs.to(device).float()
+#
+#     T, N, O = obs_seq.shape
+#
+#     # ---------- Centralized critic on JOINT obs ----------
+#     joint_seq = obs_seq.reshape(T, N * O)                # [T, N*O]
+#     v_seq = critic(joint_seq).reshape(-1)                # [T]
+#     with torch.no_grad():
+#         # Bootstrap with last joint obs unless terminal
+#         last_val = critic(last_obs.reshape(1, -1)).reshape(-1)[0]
+#         last_val = torch.where(done_seq[-1] > 0.5, torch.zeros_like(last_val), last_val)
+#
+#     # ---------- Team reward aggregation (MEAN or SUM) ----------
+#     if team_reward_reduce == "mean":
+#         r_team = rew_seq.mean(dim=-1)                    # [T]
+#     elif team_reward_reduce == "sum":
+#         r_team = rew_seq.sum(dim=-1)                     # [T]
+#     else:
+#         raise ValueError("team_reward_reduce must be 'mean' or 'sum'")
+#
+#     # Optional reward normalization + global scaling
+#     if normalize_rewards:
+#         mean_r = r_team.mean()
+#         std_r  = r_team.std(unbiased=False).clamp_min(1e-6)
+#         r_team = (r_team - mean_r) / std_r
+#     if reward_scale != 1.0:
+#         r_team = r_team * reward_scale
+#
+#     # ---------- GAE on centralized value ----------
+#     with torch.no_grad():
+#         adv = torch.zeros_like(v_seq)                    # [T]
+#         gae = torch.zeros((), device=device)
+#         for t in reversed(range(T)):
+#             nonterm = 1.0 - done_seq[t]
+#             v_next  = last_val if t == T - 1 else v_seq[t + 1]
+#             delta   = r_team[t] + gamma * nonterm * v_next - v_seq[t]
+#             gae     = delta + gamma * gae_lambda * nonterm * gae
+#             adv[t]  = gae
+#         ret = adv + v_seq                                # [T]
+#
+#     # Advantage normalization over time
+#     if normalize_adv:
+#         adv = (adv - adv.mean()) / (adv.std(unbiased=False).clamp_min(1e-6))
+#
+#     # ---------- Policy loss via LSTM actor over the sequence ----------
+#     # ActorLSTM forward accepts [T,N,O] and returns [1,T,N,A]
+#     logits_seq, _ = actor(obs_seq)                       # [1,T,N,A]
+#     logits_seq = logits_seq[0]                           # [T,N,A]
+#
+#     dist      = Categorical(logits=logits_seq)           # batched over [T,N]
+#     logp      = dist.log_prob(act_seq)                   # [T,N]
+#     entropy   = dist.entropy().mean()
+#
+#     adv_expanded = adv.unsqueeze(-1).expand(T, N)        # [T,N]
+#     policy_loss  = -(logp * adv_expanded.detach()).mean()
+#
+#     # ---------- Value loss (Huber + value clipping) ----------
+#     with torch.no_grad():
+#         old_values = v_seq.clone()                       # treat current eval as "old" target for clipping baseline
+#     values_clipped = old_values + (v_seq - old_values).clamp(-value_clip_eps, value_clip_eps)
+#
+#     v_loss_unclipped = torch.nn.functional.smooth_l1_loss(
+#         v_seq, ret.detach(), beta=huber_delta, reduction='mean'
+#     )
+#     v_loss_clipped = torch.nn.functional.smooth_l1_loss(
+#         values_clipped, ret.detach(), beta=huber_delta, reduction='mean'
+#     )
+#     value_loss = torch.max(v_loss_unclipped, v_loss_clipped)
+#
+#     # ---------- Optimize ----------
+#     total_loss = policy_loss - entropy_coef * entropy + value_coef * value_loss
+#     optim_actor.zero_grad(set_to_none=True)
+#     optim_critic.zero_grad(set_to_none=True)
+#     total_loss.backward()
+#     nn.utils.clip_grad_norm_(actor.parameters(),  grad_clip)
+#     nn.utils.clip_grad_norm_(critic.parameters(), grad_clip)
+#     optim_actor.step()
+#     optim_critic.step()
+#
+#     return {
+#         "loss_total":  float(total_loss.item()),
+#         "loss_policy": float(policy_loss.item()),
+#         "loss_value":  float(value_loss.item()),
+#         "entropy":     float(entropy.item()),
+#     }
+
+
+# # ======================= neighbor-critic MA2C update (MLP) =========================
+# def ma2c_update_neighbor_mlp(
+#     actor: nn.Module,                 # ActorMLP: local obs [O] -> logits [A]
+#     critic: nn.Module,                # CriticMLP: neighbor-aug obs [C] -> value scalar
+#     optim_actor: torch.optim.Optimizer,
+#     optim_critic: torch.optim.Optimizer,
+#     obs_seq: torch.Tensor,            # [T, N, O]  local observations (for actor)
+#     critic_obs_seq: torch.Tensor,     # [T, N, C]  neighbor-aug observations (for critic)
+#     act_seq: torch.Tensor,            # [T, N]     actions (long)
+#     rew_seq: torch.Tensor,            # [T, N]     per-agent rewards
+#     done_seq: torch.Tensor,           # [T]        1.0 if episode terminal at step t
+#     last_obs: torch.Tensor,           # [N, O]     final local obs (not used by critic)
+#     last_critic_obs: torch.Tensor,    # [N, C]     final neighbor-aug obs for bootstrap
+#     gamma: float = 0.99,
+#     gae_lambda: float = 0.95,
+#     entropy_coef: float = 0.01,
+#     value_coef: float = 0.5,
+#     grad_clip: float = 1.0,
+#     normalize_adv: bool = True,
+#     # Stabilization knobs (match trainer call)
+#     normalize_rewards: bool = True,
+#     reward_scale: float = 1.0,
+#     huber_delta: float = 1.0,
+#     value_clip_eps: float = 0.2,      # set 0 to disable clipping
+#     # How to derive team signals
+#     team_value_reduce: str = "mean",  # "mean" | "sum"
+#     team_reward_reduce: str = "mean",  # "sum" | "mean"
+# ) -> dict:
+#     """
+#     Neighbor-critic MA2C with inlined team GAE, optional reward normalization/scaling,
+#     advantage normalization, and Huber + value clipping for the critic.
+#     """
+#     device = next(actor.parameters()).device
+#
+#     obs_seq         = obs_seq.to(device).float()              # [T,N,O]
+#     critic_obs_seq  = critic_obs_seq.to(device).float()       # [T,N,C]
+#     act_seq         = act_seq.to(device).long()               # [T,N]
+#     rew_seq         = rew_seq.to(device).float()              # [T,N]
+#     done_seq        = done_seq.to(device).float()             # [T]
+#     last_critic_obs = last_critic_obs.to(device).float()      # [N,C]
+#
+#     T, N, O = obs_seq.shape
+#     C = critic_obs_seq.size(-1)
+#
+#     # -------- Critic: per-agent values on neighbor-aug inputs --------
+#     crit_flat = critic_obs_seq.reshape(T * N, C)              # [T*N,C]
+#     v_flat    = critic(crit_flat)                             # [T*N] or [T*N,1]
+#     v_agents  = v_flat.reshape(T, N)                          # [T,N]
+#
+#     last_v_agents = critic(last_critic_obs).reshape(-1)       # [N]
+#
+#     # -------- Team reward aggregation --------
+#     if team_reward_reduce == "sum":
+#         r_team = rew_seq.sum(dim=-1)                          # [T]
+#     elif team_reward_reduce == "mean":
+#         r_team = rew_seq.mean(dim=-1)                         # [T]
+#     else:
+#         raise ValueError("team_reward_reduce must be 'sum' or 'mean'")
+#
+#     # Reward normalization + global scaling (optional)
+#     if normalize_rewards:
+#         mean_r = r_team.mean()
+#         std_r  = r_team.std(unbiased=False).clamp_min(1e-6)
+#         r_team = (r_team - mean_r) / std_r
+#     if reward_scale != 1.0:
+#         r_team = r_team * reward_scale
+#
+#     # -------- Team value aggregation --------
+#     if team_value_reduce == "mean":
+#         v_team = v_agents.mean(dim=-1)                        # [T]
+#         last_v = last_v_agents.mean()                         # []
+#     elif team_value_reduce == "sum":
+#         v_team = v_agents.sum(dim=-1)                         # [T]
+#         last_v = last_v_agents.sum()                          # []
+#     else:
+#         raise ValueError("team_value_reduce must be 'mean' or 'sum'")
+#
+#     # -------- Inlined GAE on team signal --------
+#     with torch.no_grad():
+#         adv_team = torch.zeros_like(v_team)                   # [T]
+#         gae = torch.zeros((), device=device)
+#         for t in reversed(range(T)):
+#             nonterm = 1.0 - done_seq[t]
+#             v_next  = last_v if t == T - 1 else v_team[t + 1]
+#             delta   = r_team[t] + gamma * nonterm * v_next - v_team[t]
+#             gae     = delta + gamma * gae_lambda * nonterm * gae
+#             adv_team[t] = gae
+#         ret_team = adv_team + v_team                          # [T]
+#
+#     if normalize_adv:
+#         adv_team = (adv_team - adv_team.mean()) / (adv_team.std(unbiased=False).clamp_min(1e-6))
+#
+#     # -------- Policy loss (shared decentralized actor) --------
+#     obs_flat  = obs_seq.reshape(T * N, O)                     # [T*N,O]
+#     logits    = actor(obs_flat)                               # [T*N,A]
+#     dist      = torch.distributions.Categorical(logits=logits)
+#     acts_flat = act_seq.reshape(T * N)                        # [T*N]
+#     logp      = dist.log_prob(acts_flat)                      # [T*N]
+#     entropy   = dist.entropy().mean()
+#
+#     adv_broadcast = adv_team.unsqueeze(-1).expand(T, N).reshape(T * N)  # [T*N]
+#     policy_loss = -(logp * adv_broadcast.detach()).mean()
+#
+#     # -------- Value loss (Huber + optional value clipping) --------
+#     ret_broadcast = ret_team.unsqueeze(-1).expand(T, N)       # [T,N]
+#     v_pred = v_agents                                         # [T,N]
+#     v_targ = ret_broadcast.detach()                           # [T,N]
+#
+#     if value_clip_eps and value_clip_eps > 0.0:
+#         with torch.no_grad():
+#             v_old = v_pred.clone()
+#         v_clipped = v_old + (v_pred - v_old).clamp(-value_clip_eps, value_clip_eps)
+#         v_loss_unclipped = torch.nn.functional.smooth_l1_loss(v_pred,   v_targ, beta=huber_delta)
+#         v_loss_clipped   = torch.nn.functional.smooth_l1_loss(v_clipped, v_targ, beta=huber_delta)
+#         value_loss = torch.max(v_loss_unclipped, v_loss_clipped)
+#     else:
+#         value_loss = torch.nn.functional.smooth_l1_loss(v_pred, v_targ, beta=huber_delta)
+#
+#     # -------- Optimize --------
+#     total_loss = policy_loss - entropy_coef * entropy + value_coef * value_loss
+#     optim_actor.zero_grad(set_to_none=True)
+#     optim_critic.zero_grad(set_to_none=True)
+#     total_loss.backward()
+#     nn.utils.clip_grad_norm_(actor.parameters(),  grad_clip)
+#     nn.utils.clip_grad_norm_(critic.parameters(), grad_clip)
+#     optim_actor.step()
+#     optim_critic.step()
+#
+#     return {
+#         "loss_total":  float(total_loss.item()),
+#         "loss_policy": float(policy_loss.item()),
+#         "loss_value":  float(value_loss.item()),
+#         "entropy":     float(entropy.item()),
+#     }
+
+
+# =============================== MAPPO update (MLP) ================================
+# def mappo_update_mlp(
+#     actor: nn.Module,
+#     critic: nn.Module,
+#     optim_actor: torch.optim.Optimizer,
+#     optim_critic: torch.optim.Optimizer,
+#     # Backward-compatible names:
+#     obs_seq=None,                 # [T,N,O] list/np/tensor
+#     last_obs=None,                # [N,O]   list/np/tensor
+#     # Preferred names (take precedence if provided):
+#     obs_local_seq=None,           # [T,N,O]
+#     obs_joint_seq=None,           # [T,N*O]
+#     act_seq=None,                 # [T,N]   int
+#     rew_seq=None,                 # [T,N]   float
+#     done_seq=None,                # [T]     float; 1.0 terminal
+#     last_obs_joint=None,          # [N*O]
+#     gamma: float = 0.99,
+#     gae_lambda: float = 0.95,
+#     entropy_coef: float = 0.01,
+#     value_coef: float = 0.5,
+#     max_grad_norm: float = 1.0,
+#     normalize_adv: bool = True,
+#     # --- New stabilizers (optional) ---
+#     reward_scale: float = 1.0,            # e.g., 0.02~0.1 for TSC
+#     team_reduce: str = "sum",             # "sum" (default) or "mean"
+#     value_clip_eps: float = 0.2,          # PPO-style value clipping (0 disables if <=0)
+#     use_huber_value: bool = True,         # robust critic loss
+#     huber_delta: float = 1.0,
+# ):
+#     """
+#     Centralized-critic A2C update (no PPO policy ratio clip).
+#     Adds reward scaling, value clipping, and robust value loss.
+#
+#     Backward-compatible: keeps (obs_seq, last_obs) names and shapes you use today.
+#     """
+#
+#     # ------------ small helpers ------------
+#     def _as_tensor(x, device=None, dtype=None):
+#         if isinstance(x, torch.Tensor):
+#             t = x
+#         elif isinstance(x, (list, tuple)):
+#             t = torch.stack([_as_tensor(xx) for xx in x], dim=0)
+#         else:
+#             t = torch.as_tensor(x)
+#         if dtype is not None:
+#             t = t.to(dtype)
+#         if device is not None:
+#             t = t.to(device)
+#         return t
+#
+#     def _ensure_TNO(x):  # [T,N,O]
+#         if x.dim() != 3:
+#             raise ValueError(f"Expected [T,N,O], got {tuple(x.shape)}")
+#         return x
+#
+#     def _ensure_TN(x):   # [T,N]
+#         if x.dim() != 2:
+#             raise ValueError(f"Expected [T,N], got {tuple(x.shape)}")
+#         return x
+#
+#     def _ensure_T(x):    # [T]
+#         if x.dim() != 1:
+#             raise ValueError(f"Expected [T], got {tuple(x.shape)}")
+#         return x
+#
+#     device = next(actor.parameters()).device
+#
+#     # ------------ reconcile names & coerce ------------
+#     if obs_local_seq is None:
+#         if obs_seq is None:
+#             raise ValueError("Provide obs_local_seq=[T,N,O] or obs_seq=[T,N,O].")
+#         obs_local_seq = obs_seq
+#     obs_local_seq = _ensure_TNO(_as_tensor(obs_local_seq))           # [T,N,O] (CPU for now)
+#     T, N, O = obs_local_seq.shape
+#
+#     if obs_joint_seq is None:
+#         obs_joint_seq = obs_local_seq.reshape(T, N * O)
+#     else:
+#         obs_joint_seq = _as_tensor(obs_joint_seq)
+#         if obs_joint_seq.dim() != 2 or obs_joint_seq.shape[0] != T or obs_joint_seq.shape[1] != N * O:
+#             raise ValueError(f"obs_joint_seq must be [T,{N*O}], got {tuple(obs_joint_seq.shape)}")
+#
+#     if last_obs_joint is None:
+#         if last_obs is None:
+#             raise ValueError("Provide last_obs_joint=[N*O] or last_obs=[N,O].")
+#         last_obs = _as_tensor(last_obs)
+#         if last_obs.dim() != 2 or last_obs.shape != (N, O):
+#             raise ValueError(f"last_obs must be [N,O], got {tuple(last_obs.shape)}")
+#         last_obs_joint = last_obs.reshape(N * O)                      # [N*O]
+#     else:
+#         last_obs_joint = _as_tensor(last_obs_joint)
+#         if last_obs_joint.dim() != 1 or last_obs_joint.numel() != N * O:
+#             raise ValueError(f"last_obs_joint must be [N*O], got {tuple(last_obs_joint.shape)}")
+#
+#     if act_seq is None or rew_seq is None or done_seq is None:
+#         raise ValueError("act_seq, rew_seq, and done_seq must be provided.")
+#
+#     act_seq  = _ensure_TN(_as_tensor(act_seq)).long()                # [T,N]
+#     rew_seq  = _ensure_TN(_as_tensor(rew_seq)).float()               # [T,N]
+#     done_seq = _ensure_T(_as_tensor(done_seq)).float()               # [T]
+#
+#     # Move to device
+#     obs_local_seq  = obs_local_seq.to(device)
+#     obs_joint_seq  = obs_joint_seq.to(device)
+#     last_obs_joint = last_obs_joint.to(device)
+#     act_seq        = act_seq.to(device)
+#     rew_seq        = (rew_seq * reward_scale).to(device)             # <<< reward scaling
+#     done_seq       = done_seq.to(device)
+#
+#     # ------------ centralized critic values ------------
+#     v_seq = critic(obs_joint_seq).reshape(-1)                        # [T]
+#     last_val = critic(last_obs_joint.view(1, -1)).reshape(-1)[0]     # scalar
+#
+#     # team reward reducer
+#     if team_reduce == "sum":
+#         r_team = rew_seq.sum(dim=-1)                                 # [T]
+#     elif team_reduce == "mean":
+#         r_team = rew_seq.mean(dim=-1)                                # [T]
+#     else:
+#         raise ValueError("team_reduce must be 'sum' or 'mean'.")
+#
+#     # ------------ GAE (team) ------------
+#     with torch.no_grad():
+#         adv = torch.zeros_like(v_seq)                                 # [T]
+#         gae = torch.zeros((), device=device)
+#         for t in reversed(range(T)):
+#             nonterm = 1.0 - done_seq[t]
+#             v_next  = last_val if t == T - 1 else v_seq[t + 1]
+#             delta   = r_team[t] + gamma * nonterm * v_next - v_seq[t]
+#             gae     = delta + gamma * gae_lambda * nonterm * gae
+#             adv[t]  = gae
+#         ret = adv + v_seq                                             # [T]
+#         old_v = v_seq.detach()                                        # for value clipping
+#
+#     # Advantage normalization (over time only; shared across agents)
+#     if normalize_adv:
+#         adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
+#
+#     # ------------ policy loss (shared decentralized actors) ------------
+#     obs_flat = obs_local_seq.reshape(T * N, O)                        # [T*N, O]
+#     logits   = actor(obs_flat)                                        # [T*N, A]
+#     dist     = torch.distributions.Categorical(logits=logits)
+#
+#     acts_flat = act_seq.reshape(T * N)                                # [T*N]
+#     logp      = dist.log_prob(acts_flat)                              # [T*N]
+#     entropy   = dist.entropy().mean()
+#
+#     # Broadcast adv from team to all agents at each t
+#     adv_expanded = adv.unsqueeze(-1).expand(T, N).reshape(T * N)      # [T*N]
+#     policy_loss  = -(logp * adv_expanded.detach()).mean()
+#
+#     # ------------ value loss (clipped & robust) ------------
+#     if value_clip_eps is not None and value_clip_eps > 0.0:
+#         v_clipped = old_v + (v_seq - old_v).clamp(-value_clip_eps, value_clip_eps)
+#         if use_huber_value:
+#             vloss1 = nn.functional.smooth_l1_loss(v_seq,    ret.detach(), reduction='none')
+#             vloss2 = nn.functional.smooth_l1_loss(v_clipped, ret.detach(), reduction='none')
+#         else:
+#             vloss1 = 0.5 * (ret.detach() - v_seq).pow(2)
+#             vloss2 = 0.5 * (ret.detach() - v_clipped).pow(2)
+#         value_loss = torch.max(vloss1, vloss2).mean()
+#     else:
+#         if use_huber_value:
+#             value_loss = nn.functional.smooth_l1_loss(v_seq, ret.detach())
+#         else:
+#             value_loss = 0.5 * (ret.detach() - v_seq).pow(2).mean()
+#
+#     # ------------ optimize ------------
+#     loss_total = policy_loss + value_coef * value_loss - entropy_coef * entropy
+#
+#     optim_actor.zero_grad(set_to_none=True)
+#     optim_critic.zero_grad(set_to_none=True)
+#     loss_total.backward()
+#     torch.nn.utils.clip_grad_norm_(actor.parameters(), max_grad_norm)
+#     torch.nn.utils.clip_grad_norm_(critic.parameters(), max_grad_norm)
+#     optim_actor.step()
+#     optim_critic.step()
+#
+#     return {
+#         "loss_total":  float(loss_total.item()),
+#         "loss_policy": float(policy_loss.item()),
+#         "loss_value":  float(value_loss.item()),
+#         "entropy":     float(entropy.item()),
+#         "value_mean":  float(v_seq.mean().item()),
+#         "adv_mean":    float(adv.mean().item()),
+#     }
 
 # ================================ Soft Update ==================================
 
