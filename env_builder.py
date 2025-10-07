@@ -28,6 +28,10 @@ def build_train_env(args):
         suppress_sumo_output=True,
     )
 
+# def list_trip_files_for_grid(grid_n: int, env_ep_length: int) -> List[Path]:
+#     trip_dir = Path(f"./eval_trips_grid_{grid_n}_len{env_ep_length}")
+#     return sorted(trip_dir.glob("*.xml"))
+
 def list_trip_files_for_grid(grid_n: int) -> List[Path]:
     trip_dir = Path(f"./eval_trips_grid_{grid_n}")
     return sorted(trip_dir.glob("*.xml"))
@@ -43,6 +47,8 @@ class EvalEnvPool:
 
     @classmethod
     def from_args(cls, args) -> "EvalEnvPool":
+        # eval_ep_length = args.episode_steps * args.sumo_steps_per_env_step
+        # trip_paths = list_trip_files_for_grid(args.grid_n, eval_ep_length)
         trip_paths = list_trip_files_for_grid(args.grid_n)
         if not trip_paths:
             raise FileNotFoundError(f"No *.xml trip files in {trips_dir_for_grid(args.grid_n).resolve()}")
