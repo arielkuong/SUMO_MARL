@@ -1613,6 +1613,291 @@ def ma2c_pa_update_lstm(
         "v_mean":      float(v_seq.mean().item()),
     }
 
+# ============================ MA2C-PA updater (GNN)=======================
+def ma2c_pa_update_gnn_attn(
+    actor: nn.Module,                      # ActorGNNAttn: (X_t, edge) -> [N,A]
+    critic_pa: nn.Module,                  # CriticGNNPerAgentAttn: (X_t, edge) -> [N]
+    optim_actor: torch.optim.Optimizer,
+    optim_critic: torch.optim.Optimizer,
+    obs_seq: torch.Tensor,                 # [T, N, O]
+    act_seq: torch.Tensor,                 # [T, N]  (long)
+    rew_seq: torch.Tensor,                 # [T, N]  (float)
+    done_seq: torch.Tensor,                # [T]     (float 0/1)
+    last_obs: torch.Tensor,                # [N, O]
+    edge_index: torch.Tensor,              # [2, E] (long)
+    edge_attr: Optional[torch.Tensor] = None,  # [E, D_e] or None
+    # A2C/GAE
+    gamma: float = 0.97,
+    gae_lambda: float = 0.90,
+    entropy_coef: float = 0.02,
+    value_coef: float = 0.5,
+    grad_clip: float = 1.0,
+    # Reward handling
+    advantage_mode: str = "per_agent",         # {"per_agent","team"}
+    team_reward_reduce: str = "mean",          # {"mean","sum"} (only when advantage_mode="team")
+    normalize_rewards: str = "per_agent",      # {"off","per_agent","global"}
+    reward_scale: float = 1.0,
+    # Advantage/value stabilisers
+    normalize_adv: bool = True,
+    huber_delta: float = 1.0,
+    value_clip_eps: float = 0.2,
+) -> Dict[str, float]:
+
+    device = next(actor.parameters()).device
+    T, N, O = obs_seq.shape
+
+    # ---- To device / types ----
+    obs_seq  = obs_seq.to(device).float()    # [T,N,O]
+    acts     = act_seq.to(device).long()     # [T,N]
+    dones    = done_seq.to(device).float()   # [T]
+    rews_in  = rew_seq.to(device).float()    # [T,N]
+    last_obs = last_obs.to(device).float()   # [N,O]
+
+    edge_index = edge_index.to(device)
+    if edge_attr is not None:
+        edge_attr = edge_attr.to(device)
+
+    # ---- Forward through actor/critic per time step ----
+    logits_list, v_list = [], []
+    for t in range(T):
+        X_t = obs_seq[t]                                       # [N,O]
+        logits_t = actor(X_t, edge_index, edge_attr)           # [N,A]
+        v_t      = critic_pa(X_t, edge_index, edge_attr)       # [N]
+        logits_list.append(logits_t)
+        v_list.append(v_t)
+
+    logits = torch.stack(logits_list, dim=0)                   # [T,N,A]
+    v_seq  = torch.stack(v_list,   dim=0)                      # [T,N]
+
+    dist       = Categorical(logits=logits)
+    logp_taken = dist.log_prob(acts)                           # [T,N]
+    entropy    = dist.entropy().mean()
+
+    # ---- Bootstrap value at last_obs unless terminal ----
+    with torch.no_grad():
+        if dones[-1] > 0.5:
+            v_last = torch.zeros((N,), device=device)
+        else:
+            v_last = critic_pa(last_obs, edge_index, edge_attr)  # [N]
+
+    # ---- Inlined reward-matrix construction (no helper) ----
+    if advantage_mode == "per_agent":
+        r_mat = rews_in.clone()                                 # [T,N]
+    elif advantage_mode == "team":
+        if team_reward_reduce == "mean":
+            r_team = rews_in.mean(dim=-1, keepdim=True)         # [T,1]
+        elif team_reward_reduce == "sum":
+            r_team = rews_in.sum(dim=-1, keepdim=True)          # [T,1]
+        else:
+            raise ValueError("team_reward_reduce must be {'mean','sum'}")
+        r_mat = r_team.expand(T, N)                              # [T,N]
+    else:
+        raise ValueError("advantage_mode must be {'per_agent','team'}")
+
+    # ---- Reward normalisation (optional) ----
+    if normalize_rewards != "off":
+        if normalize_rewards == "per_agent":
+            mean = r_mat.mean(dim=0, keepdim=True)                                   # [1,N]
+            std  = r_mat.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
+            r_mat = reward_scale * (r_mat - mean) / std
+        elif normalize_rewards == "global":
+            mean = r_mat.mean()
+            std  = r_mat.std(unbiased=False).clamp_min(1e-6)
+            r_mat = reward_scale * (r_mat - mean) / std
+        else:
+            raise ValueError("normalize_rewards must be {'off','per_agent','global'}")
+
+    # ---- Vectorised per-agent GAE over time ----
+    with torch.no_grad():
+        adv = torch.zeros_like(v_seq)                        # [T,N]
+        gae = torch.zeros((N,), device=device)               # [N]
+        for t in reversed(range(T)):
+            nonterm = 1.0 - dones[t]
+            v_next  = v_last if t == T - 1 else v_seq[t + 1]
+            delta   = r_mat[t] + gamma * nonterm * v_next - v_seq[t]
+            gae     = delta + gamma * gae_lambda * nonterm * gae
+            adv[t]  = gae
+        ret = adv + v_seq                                    # [T,N]
+
+    # ---- Advantage normalisation (global over T*N) ----
+    if normalize_adv:
+        flat = adv.reshape(-1)
+        adv = (adv - flat.mean()) / (flat.std(unbiased=False).clamp_min(1e-6))
+
+    # ---- Losses ----
+    policy_loss = -(logp_taken * adv.detach()).mean()
+
+    v_pred   = v_seq
+    v_target = ret.detach()
+
+    if value_clip_eps and value_clip_eps > 0.0:
+        v_old = v_pred.detach()
+        v_clipped = v_old + (v_pred - v_old).clamp(-value_clip_eps, value_clip_eps)
+        v_loss_unclipped = nn.functional.smooth_l1_loss(v_pred,     v_target, reduction="mean", beta=huber_delta)
+        v_loss_clipped   = nn.functional.smooth_l1_loss(v_clipped,  v_target, reduction="mean", beta=huber_delta)
+        value_loss = torch.max(v_loss_unclipped, v_loss_clipped)
+    else:
+        value_loss = nn.functional.smooth_l1_loss(v_pred, v_target, reduction="mean", beta=huber_delta)
+
+    total_loss = policy_loss - entropy_coef * entropy + value_coef * value_loss
+
+    # ---- Optimise ----
+    optim_actor.zero_grad(set_to_none=True)
+    optim_critic.zero_grad(set_to_none=True)
+    total_loss.backward()
+    nn.utils.clip_grad_norm_(actor.parameters(),     grad_clip)
+    nn.utils.clip_grad_norm_(critic_pa.parameters(), grad_clip)
+    optim_actor.step()
+    optim_critic.step()
+
+    return {
+        "loss_total":  float(total_loss.item()),
+        "loss_policy": float(policy_loss.item()),
+        "loss_value":  float(value_loss.item()),
+        "entropy":     float(entropy.item()),
+        "adv_mean":    float(adv.mean().item()),
+        "v_mean":      float(v_seq.mean().item()),
+    }
+
+# ============================ MA2C-PA updater (GNN+LSTM)=======================
+def ma2c_pa_update_gnn_lstm_attn(
+    actor: nn.Module,                      # ActorGNNLSTMAttn: ([T,N,O], edge) -> ([T,N,A], hidden)
+    critic_pa: nn.Module,                  # CriticGNNPerAgentLSTMAttn: ([T,N,O], edge) -> ([T,N], hidden)
+    optim_actor: torch.optim.Optimizer,
+    optim_critic: torch.optim.Optimizer,
+    obs_seq: torch.Tensor,                 # [T, N, O]
+    act_seq: torch.Tensor,                 # [T, N]  (long)
+    rew_seq: torch.Tensor,                 # [T, N]  (float)
+    done_seq: torch.Tensor,                # [T]     (float 0/1)
+    last_obs: torch.Tensor,                # [N, O]
+    edge_index: torch.Tensor,              # [2, E]  (long)
+    edge_attr: Optional[torch.Tensor] = None,  # [E, D_e] or None
+    # A2C/GAE
+    gamma: float = 0.97,
+    gae_lambda: float = 0.90,
+    entropy_coef: float = 0.02,
+    value_coef: float = 0.5,
+    grad_clip: float = 1.0,
+    # Reward handling
+    advantage_mode: str = "per_agent",         # {"per_agent","team"}
+    team_reward_reduce: str = "mean",          # {"mean","sum"} (when advantage_mode == "team")
+    normalize_rewards: str = "per_agent",      # {"off","per_agent","global"}
+    reward_scale: float = 1.0,
+    # Advantage/value stabilisers
+    normalize_adv: bool = True,
+    huber_delta: float = 1.0,
+    value_clip_eps: float = 0.2,
+) -> Dict[str, float]:
+
+    device = next(actor.parameters()).device
+    T, N, O = obs_seq.shape
+
+    # ---- To device ----
+    obs_seq  = obs_seq.to(device).float()     # [T,N,O]
+    acts     = act_seq.to(device).long()      # [T,N]
+    dones    = done_seq.to(device).float()    # [T]
+    rews_in  = rew_seq.to(device).float()     # [T,N]
+    last_obs = last_obs.to(device).float()    # [N,O]
+
+    edge_index = edge_index.to(device)
+    if edge_attr is not None:
+        edge_attr = edge_attr.to(device)
+
+    # ---- Sequence forward (fresh hidden) ----
+    logits_tna, _ = actor(obs_seq, edge_index, edge_attr, hidden=None)  # [T,N,A]
+    v_tn, _       = critic_pa(obs_seq, edge_index, edge_attr, hidden=None)  # [T,N]
+
+    dist       = Categorical(logits=logits_tna)
+    logp_taken = dist.log_prob(acts)                 # [T,N]
+    entropy    = dist.entropy().mean()
+
+    # ---- Bootstrap at last_obs unless terminal ----
+    with torch.no_grad():
+        if dones[-1] > 0.5:
+            v_last = torch.zeros((N,), device=device)
+        else:
+            v_last, _ = critic_pa.step(last_obs, edge_index, edge_attr, hidden=None)  # [N]
+
+    # ---- Build reward matrix (inlined helper) ----
+    if advantage_mode == "per_agent":
+        r_mat = rews_in.clone()                                  # [T,N]
+    elif advantage_mode == "team":
+        if team_reward_reduce == "mean":
+            r_team = rews_in.mean(dim=-1, keepdim=True)          # [T,1]
+        elif team_reward_reduce == "sum":
+            r_team = rews_in.sum(dim=-1, keepdim=True)           # [T,1]
+        else:
+            raise ValueError("team_reward_reduce must be {'mean','sum'}")
+        r_mat = r_team.expand(T, N)                               # [T,N]
+    else:
+        raise ValueError("advantage_mode must be {'per_agent','team'}")
+
+    # ---- Reward normalisation ----
+    if normalize_rewards != "off":
+        if normalize_rewards == "per_agent":
+            mean = r_mat.mean(dim=0, keepdim=True)                                   # [1,N]
+            std  = r_mat.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
+            r_mat = reward_scale * (r_mat - mean) / std
+        elif normalize_rewards == "global":
+            mean = r_mat.mean()
+            std  = r_mat.std(unbiased=False).clamp_min(1e-6)
+            r_mat = reward_scale * (r_mat - mean) / std
+        else:
+            raise ValueError("normalize_rewards must be {'off','per_agent','global'}")
+
+    # ---- Vectorised per-agent GAE over time ----
+    with torch.no_grad():
+        adv = torch.zeros_like(v_tn)                         # [T,N]
+        gae = torch.zeros((N,), device=device)               # [N]
+        for t in reversed(range(T)):
+            nonterm = 1.0 - dones[t]
+            v_next  = v_last if t == T - 1 else v_tn[t + 1]
+            delta   = r_mat[t] + gamma * nonterm * v_next - v_tn[t]
+            gae     = delta + gamma * gae_lambda * nonterm * gae
+            adv[t]  = gae
+        ret = adv + v_tn                                     # [T,N]
+
+    # ---- Advantage normalisation ----
+    if normalize_adv:
+        flat = adv.reshape(-1)
+        adv = (adv - flat.mean()) / (flat.std(unbiased=False).clamp_min(1e-6))
+
+    # ---- Losses ----
+    policy_loss = -(logp_taken * adv.detach()).mean()
+
+    v_pred   = v_tn
+    v_target = ret.detach()
+
+    if value_clip_eps and value_clip_eps > 0.0:
+        v_old = v_pred.detach()
+        v_clipped = v_old + (v_pred - v_old).clamp(-value_clip_eps, value_clip_eps)
+        v_loss_unclipped = nn.functional.smooth_l1_loss(v_pred,     v_target, reduction="mean", beta=huber_delta)
+        v_loss_clipped   = nn.functional.smooth_l1_loss(v_clipped,  v_target, reduction="mean", beta=huber_delta)
+        value_loss = torch.max(v_loss_unclipped, v_loss_clipped)
+    else:
+        value_loss = nn.functional.smooth_l1_loss(v_pred, v_target, reduction="mean", beta=huber_delta)
+
+    total_loss = policy_loss - entropy_coef * entropy + value_coef * value_loss
+
+    # ---- Optimise ----
+    optim_actor.zero_grad(set_to_none=True)
+    optim_critic.zero_grad(set_to_none=True)
+    total_loss.backward()
+    nn.utils.clip_grad_norm_(actor.parameters(),     grad_clip)
+    nn.utils.clip_grad_norm_(critic_pa.parameters(), grad_clip)
+    optim_actor.step()
+    optim_critic.step()
+
+    return {
+        "loss_total":  float(total_loss.item()),
+        "loss_policy": float(policy_loss.item()),
+        "loss_value":  float(value_loss.item()),
+        "entropy":     float(entropy.item()),
+        "adv_mean":    float(adv.mean().item()),
+        "v_mean":      float(v_tn.mean().item()),
+    }
+
+
 # # =============================== MA2C update (MLP) ================================
 # def ma2c_update_mlp(
 #     actor: nn.Module,                 # ActorMLP: local obs [O] -> logits [A]
