@@ -57,17 +57,12 @@ def main():
     runs = {
         "IDQN (MLP)"               : "dqn_mlp_shared",
         "IDRQN (LSTM)"             : "drqn_lstm_shared_seqlen8",
-        # "DQN (MLP, with nbobs)"    : "dqn_mlp_shared_neighbor_obs",
-        # "DRQN (LSTM, with nbobs)"  : "drqn_lstm_shared_nbobs_seqlen8",
         "DQN (GNN)"                : "dqn_gnn_shared",
         "DRQN (GNN+LSTM)"          : "drqn_gnn_lstm_shared_seqlen8",
         "DQN (CTDE)"               : "vdn_ctde_mlp_shared",
         "DRQN (CTDE+LSTM)"         : "vdn_ctde_lstm_shared_seqlen8",
         "DQN (CTDE+GNN)"           : "vdn_ctde_gnn_shared",
         "DRQN (CTDE+GNN+LSTM)"     : "vdn_ctde_gnn_lstm_shared_seqlen8",
-        # "IA2C (MLP)"               : "ia2c_shared_mlp",
-        # "IA2C (LSTM)"              : "ia2c_shared_lstm",
-        # "MA2C (MLP)"               : "ma2c_shared_mlp",
     }
 
     files = {

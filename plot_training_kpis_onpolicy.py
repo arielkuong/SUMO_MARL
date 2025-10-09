@@ -55,13 +55,15 @@ def main():
     # Run name prefixes must match your EvalHistory run_name in training scripts
     runs = {
         "IA2C (MLP)"                                : "ia2c_mlp_shared",
-        "IA2C (GNN)"                                : "ia2c_gnn_shared",
         "IA2C (LSTM)"                               : "ia2c_lstm_shared",
+        "IA2C (GNN)"                                : "ia2c_gnn_shared",
         "IA2C (GNN+LSTM)"                           : "ia2c_gnn_lstm_shared",
         # "IA2C (LSTM actor, MLP critic)"             : "ia2c_lstm_actor_mlp_critic",
         # "IA2C (MLP actor, LSTM critic)"             : "ia2c_mlp_actor_lstm_critic",
         "MA2C-PA (MLP)"                             : "ma2c_pa_mlp",
         "MA2C-PA (LSTM)"                            : "ma2c_pa_lstm",
+        "MA2C-PA (GNN)"                             : "ma2c_pa_gnn_attn",
+        "MA2C-PA (GNN+LSTM)"                        : "ma2c_pa_gnn_lstm",
         # "MA2C (MLP)"                                : "ma2c_mlp",
         # "MA2C-PA (MLP, team R)"                     : "ma2c_pa_mlp_teamreward",
         # "MA2C (Actor LSTM, Critic MLP)"             : "ma2c_actor_lstm",
