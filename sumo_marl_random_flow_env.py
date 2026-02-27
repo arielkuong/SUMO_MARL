@@ -96,6 +96,7 @@ class SumoGridMARLRandomEnv:
         self.lanes_per_edge = lanes_per_edge
         self.spacing = spacing
         self.fringe_len = fringe_len
+        self.step_length_internal = float(step_length_internal)
         self.sumo_steps_per_env_step = sumo_steps_per_env_step
         self.episode_steps = episode_steps
         self.section_count = section_count
@@ -151,6 +152,7 @@ class SumoGridMARLRandomEnv:
         # Per-vehicle bookkeeping
         self._veh_depart_time: Dict[str, float] = {}
         self._veh_wait_time_last: Dict[str, float] = {}
+        self._veh_wait_custom: Dict[str, float] = {}
 
     # ---------------------- Network construction ----------------------
     def _write_nodes_and_edges(self):
@@ -262,10 +264,13 @@ class SumoGridMARLRandomEnv:
     def _discover_tls_infos_traci(self) -> List[TLSInfo]:
         tls_ids = list(traci.trafficlight.getIDList())
         tls_infos: List[TLSInfo] = []
+
         for tls_id in sorted(tls_ids):
             links = traci.trafficlight.getControlledLinks(tls_id)
-            incoming = []
+            incoming: List[str] = []
             seen = set()
+
+            # First pass: prefer lanes whose lane index is within lanes_per_edge
             for group in links:
                 for link in (group if isinstance(group, (list, tuple)) else [group]):
                     in_lane = link[0]
@@ -280,9 +285,11 @@ class SumoGridMARLRandomEnv:
                     if in_lane not in seen:
                         incoming.append(in_lane)
                         seen.add(in_lane)
+
+            # Fallback: just take any remaining incoming lanes until we hit target count
             if len(incoming) < 4 * self.lanes_per_edge:
                 for group in links:
-                    for link in (group if isinstance(g, (list, tuple)) else [g]):
+                    for link in (group if isinstance(group, (list, tuple)) else [group]):
                         in_lane = link[0]
                         if in_lane.startswith(":") or in_lane in seen:
                             continue
@@ -292,8 +299,10 @@ class SumoGridMARLRandomEnv:
                             break
                     if len(incoming) >= 4 * self.lanes_per_edge:
                         break
+
             incoming = incoming[: 4 * self.lanes_per_edge]
             tls_infos.append(TLSInfo(tls_id=tls_id, incoming_lanes=incoming))
+
         return tls_infos
 
     # ---------------------- Random fringe-to-fringe flows ----------------------
@@ -319,7 +328,7 @@ class SumoGridMARLRandomEnv:
                     continue
                 ods.append((src.getID(), dst.getID()))
 
-        total_time = float(self.episode_steps * self.sumo_steps_per_env_step)
+        total_time = float(self.episode_steps * self.sumo_steps_per_env_step) * self.step_length_internal
         section_len = total_time / float(self.section_count)
 
         trips_root = ET.Element("routes")
@@ -383,6 +392,7 @@ class SumoGridMARLRandomEnv:
         self._kpi_total_waiting_time = 0.0
         self._veh_depart_time.clear()
         self._veh_wait_time_last.clear()
+        self._veh_wait_custom.clear()
 
     # ---------------------- Env API ----------------------
     def reset(self) -> Dict[str, np.ndarray]:
@@ -453,43 +463,68 @@ class SumoGridMARLRandomEnv:
         return self._observe_all()
 
     def step(self, actions: Dict[str, int]) -> Tuple[Dict[str, np.ndarray], Dict[str, float], bool, Dict]:
+        """
+        Env step:
+        - Apply per-agent discrete phase actions (0..3)
+        - Advance SUMO by self.sumo_steps_per_env_step internal steps
+        - Update KPIs online:
+            * completed-only totals via arrived vehicles
+            * custom per-vehicle waiting time accumulator (speed-threshold based)
+            * exact(er) depart timestamping at begin-of-step
+            * additional "all vehicles (active+completed)" mean travel/wait metrics
+        - Return obs, rewards, done, info
+        """
         assert set(actions.keys()) == set(self.agent_ids)
 
         # Apply actions (phase indices 0..3)
         for aid, a in actions.items():
             traci.trafficlight.setPhase(aid, int(a) % 4)
 
+        dt = float(self.step_length_internal)  # seconds per internal SUMO step
+
         # Advance SUMO in internal steps; update KPIs online
         for _ in range(self.sumo_steps_per_env_step):
-            # Snapshot waiting times BEFORE step (arrivals will be removed after step)
+            # --- begin-of-step time (more exact depart timestamps) ---
+            t_before = float(traci.simulation.getTime())
+
+            # --- update custom waiting accumulator for vehicles currently present ---
+            # We define "waiting" as nearly stopped: speed < 0.1 m/s
             try:
                 for vid in traci.vehicle.getIDList():
                     try:
-                        self._veh_wait_time_last[vid] = float(traci.vehicle.getAccumulatedWaitingTime(vid))
+                        if float(traci.vehicle.getSpeed(vid)) < 0.1:
+                            self._veh_wait_custom[vid] = self._veh_wait_custom.get(vid, 0.0) + dt
+                        else:
+                            # ensure key exists so active vehicles are included in "all vehicles" stats
+                            self._veh_wait_custom.setdefault(vid, 0.0)
                     except Exception:
+                        # If a vehicle disappears between getIDList and getSpeed, ignore safely
                         pass
             except Exception:
                 pass
 
+            # --- advance simulation ---
             traci.simulationStep()
-            t_now = float(traci.simulation.getTime())
+            t_after = float(traci.simulation.getTime())
 
-            # Record depart times for vehicles that entered this internal step
+            # --- record depart times for vehicles that entered this internal step ---
+            # Stamp departures at begin-of-step (t_before)
             try:
                 for vid in traci.simulation.getDepartedIDList():
-                    self._veh_depart_time[vid] = t_now
-                    # ensure a wait snapshot exists
-                    if vid not in self._veh_wait_time_last:
-                        self._veh_wait_time_last[vid] = 0.0
+                    self._veh_depart_time[vid] = t_before
+                    self._veh_wait_custom.setdefault(vid, 0.0)
             except Exception:
                 pass
 
-            # Finalise KPIs for vehicles that arrived this internal step
+            # --- finalise KPIs for vehicles that arrived this internal step ---
             try:
                 for vid in traci.simulation.getArrivedIDList():
-                    dep_t = self._veh_depart_time.pop(vid, t_now)  # fallback: t_now
-                    travel = max(t_now - dep_t, 0.0)
-                    wait = float(self._veh_wait_time_last.pop(vid, 0.0))
+                    dep_t = self._veh_depart_time.pop(vid, t_before)  # fallback: t_before
+                    travel = max(t_after - dep_t, 0.0)
+
+                    # Use our custom waiting accumulator (closer to "final" since it persists past arrival)
+                    wait = float(self._veh_wait_custom.pop(vid, 0.0))
+
                     self._kpi_total_travel_time += travel
                     self._kpi_total_waiting_time += wait
                     self._kpi_completed += 1
@@ -499,29 +534,61 @@ class SumoGridMARLRandomEnv:
         self._step_count += 1
 
         observations = self._observe_all()
+
         # --- rewards: raw -> normalized ---
         raw_rewards = self._compute_raw_rewards(observations)
         rewards = self._normalize_rewards(raw_rewards)
 
-        # Cumulative KPI snapshot (whole episode so far)
-        elapsed_sim_time = max(traci.simulation.getTime(), 1e-6)  # seconds
-        throughput_completed = self._kpi_completed
-        throughput_per_hour = (throughput_completed / elapsed_sim_time) * 3600.0
-        mean_travel_time = (self._kpi_total_travel_time / throughput_completed) if throughput_completed > 0 else 0.0
-        mean_waiting_time = (self._kpi_total_waiting_time / throughput_completed) if throughput_completed > 0 else 0.0
+        # --- KPI snapshot ---
+        t_now = float(traci.simulation.getTime())
+        elapsed_sim_time = max(t_now, 1e-6)  # seconds
+
+        completed = int(self._kpi_completed)
+        throughput_per_hour = (completed / elapsed_sim_time) * 3600.0
+
+        # Completed-only means (trip averages for arrived vehicles)
+        mean_travel_completed = (self._kpi_total_travel_time / completed) if completed > 0 else 0.0
+        mean_wait_completed = (self._kpi_total_waiting_time / completed) if completed > 0 else 0.0
+
+        # Active vehicles (present in the system): those that have departed but not arrived
+        active_ids = list(self._veh_depart_time.keys())
+        active = len(active_ids)
+
+        sum_active_travel = 0.0
+        sum_active_wait = 0.0
+        for vid in active_ids:
+            dep_t = float(self._veh_depart_time.get(vid, t_now))
+            sum_active_travel += max(t_now - dep_t, 0.0)
+            sum_active_wait += float(self._veh_wait_custom.get(vid, 0.0))
+
+        total_veh = completed + active
+
+        # "All vehicles" means (completed + active partial trips)
+        mean_travel_all = ((self._kpi_total_travel_time + sum_active_travel) / total_veh) if total_veh > 0 else 0.0
+        mean_wait_all = ((self._kpi_total_waiting_time + sum_active_wait) / total_veh) if total_veh > 0 else 0.0
 
         done = self._step_count >= self.episode_steps
         info = {
             "network_kpis": {
-                "completed_vehicles": int(throughput_completed),
+                "completed_vehicles": int(completed),
+                "active_vehicles": int(active),
+                "total_vehicles_seen_or_active": int(total_veh),
                 "throughput_veh_per_hour": float(throughput_per_hour),
-                "mean_travel_time_s": float(mean_travel_time),
-                "mean_waiting_time_s": float(mean_waiting_time),
+
+                # Completed-only (old behaviour, but now with improved waiting/depart stamping)
+                "mean_travel_time_s_completed": float(mean_travel_completed),
+                "mean_waiting_time_s_completed": float(mean_wait_completed),
+
+                # All vehicles currently present + completed (new behaviour)
+                "mean_travel_time_s": float(mean_travel_all),
+                "mean_waiting_time_s": float(mean_wait_all),
             },
-            "raw_rewards": raw_rewards,  # <--- keep original (unscaled) for logging
+            "raw_rewards": raw_rewards,  # keep original (unscaled) for logging
         }
+
         if done:
             self.close()
+
         return observations, rewards, done, info
 
     def close(self):
