@@ -529,21 +529,15 @@ class SumoGridMARLFixedEnv:
                 "completed_vehicles": int(completed),
                 "active_vehicles": int(active),
                 "total_vehicles_seen_or_active": int(total_veh),
-
                 "throughput_veh_per_hour": float(throughput_vph),
 
-                # Keep old keys for backwards compatibility (completed-only),
-                # but now these are computed from our improved depart/wait logic.
-                "mean_travel_time_s": float(mean_travel_completed),
-                "mean_waiting_time_s": float(mean_wait_completed),
-
-                # New keys: "all vehicles" (active+completed)
-                "mean_travel_time_s_all": float(mean_travel_all),
-                "mean_waiting_time_s_all": float(mean_wait_all),
-
-                # Optional explicit naming for clarity
+                # Completed-only (old behaviour, but now with improved waiting/depart stamping)
                 "mean_travel_time_s_completed": float(mean_travel_completed),
                 "mean_waiting_time_s_completed": float(mean_wait_completed),
+
+                # All vehicles currently present + completed (new behaviour)
+                "mean_travel_time_s": float(mean_travel_all),
+                "mean_waiting_time_s": float(mean_wait_all),
             },
             "raw_rewards": raw_rewards,
         }
