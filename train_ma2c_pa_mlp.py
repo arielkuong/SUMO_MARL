@@ -192,7 +192,7 @@ def run_training(args):
 def parse_args():
     parser = argparse.ArgumentParser("MA2C-PA (Per-Agent Central Critic, MLP, single-episode updates)")
     parser.add_argument('--grid-n', type=int, default=3)
-    parser.add_argument('--episodes', type=int, default=500)
+    parser.add_argument('--episodes', type=int, default=300)
     parser.add_argument('--eval-every', type=int, default=10)
     parser.add_argument('--episode-steps', type=int, default=100)
     parser.add_argument('--sumo-steps-per-env-step', type=int, default=5)
