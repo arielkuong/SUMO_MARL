@@ -69,7 +69,8 @@ def evaluate_ma2c_shared(args, actor: nn.Module, agent_id_list: List[str], run_n
 
 # ---------------- training loop (single-episode updates; MA2C-PA) ----------------
 def run_training(args):
-    device = torch.device('cuda' if torch.cuda.is_available() and not args.cpu else 'cpu')
+    # device = torch.device('cuda' if torch.cuda.is_available() and not args.cpu else 'cpu')
+    device = torch.device(args.device)
     set_global_seed(args.seed)
     best_eval_return = -np.inf
 
@@ -199,8 +200,8 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--gui', action='store_true')
     parser.add_argument('--gui-delay-ms', type=int, default=0)
-    parser.add_argument('--cpu', action='store_true')
     parser.add_argument('--logdir', type=str, default='logs')
+    parser.add_argument('--device', type=str, default='cuda')
 
     # A2C/GAE + losses
     parser.add_argument('--gamma', type=float, default=0.97)
