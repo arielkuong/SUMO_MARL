@@ -72,7 +72,8 @@ def evaluate_idqn_lstm_shared(args, shared_q: RecurrentQNet, agent_ids: List[str
 
 # ------------------------------------------------------------
 def run_training(args):
-    device = torch.device('cuda' if torch.cuda.is_available() and not args.cpu else 'cpu')
+    # device = torch.device('cuda' if torch.cuda.is_available() and not args.cpu else 'cpu')
+    device = torch.device(args.device)
     set_global_seed(args.seed)
     best_eval_return = -np.inf
 
@@ -204,8 +205,8 @@ def parse_args():
     p.add_argument('--gamma', type=float, default=0.99)
     p.add_argument('--gui', action='store_true')
     p.add_argument('--gui-delay-ms', type=int, default=0)
-    p.add_argument('--cpu', action='store_true')
     p.add_argument('--logdir', type=str, default='logs')
+    p.add_argument('--device', type=str, default='cuda')
 
     # LSTM model
     p.add_argument('--hidden', type=int, default=128)
