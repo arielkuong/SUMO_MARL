@@ -90,7 +90,7 @@ def evaluate_idrqn_lstm_shared(args,
 
 def run_training(args):
     # compute_device = torch.device('cuda' if torch.cuda.is_available() and not args.cpu else 'cpu')
-    device = torch.device(args.device)
+    compute_device = torch.device(args.device)
     set_global_seed(args.seed)
     best_eval_return = -np.inf
 
