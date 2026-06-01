@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse
 from typing import List, Dict
 
 import numpy as np
@@ -12,7 +11,7 @@ from datetime import datetime
 
 from marl_utils.models import ActorMLP, CriticPAMLP
 from marl_utils.network_update import ma2c_pa_update_mlp
-from marl_utils.common import set_global_seed, EvalHistory, clear_eval_history
+from marl_utils.common import parse_args, set_global_seed, EvalHistory, clear_eval_history
 from env_builder import build_train_env, get_or_create_eval_pool
 
 # ------------------ evaluation (decentralized greedy; actor only) ------------------
@@ -164,7 +163,7 @@ def run_training(args):
             # MA2C-PA knobs
             advantage_mode=args.advantage_mode,                # "per_agent" (default) or "team"
             team_reward_reduce=args.team_reward_reduce,        # used when advantage_mode="team"
-            normalize_rewards=args.normalize_rewards,          # "off" | "per_agent" | "global"
+            normalize_rewards=args.normalize_rewards_mode,          # "off" | "per_agent" | "global"
             reward_scale=args.reward_scale,
             normalize_adv=args.normalize_adv,
             huber_delta=args.huber_delta,
@@ -188,52 +187,6 @@ def run_training(args):
 
     train_env.close()
 
-
-# ------------------ CLI ------------------
-def parse_args():
-    parser = argparse.ArgumentParser("MA2C-PA (Per-Agent Central Critic, MLP, single-episode updates)")
-    parser.add_argument('--grid-n', type=int, default=3)
-    parser.add_argument('--episodes', type=int, default=300)
-    parser.add_argument('--eval-every', type=int, default=10)
-    parser.add_argument('--episode-steps', type=int, default=100)
-    parser.add_argument('--sumo-steps-per-env-step', type=int, default=5)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--gui', action='store_true')
-    parser.add_argument('--gui-delay-ms', type=int, default=0)
-    parser.add_argument('--logdir', type=str, default='logs')
-    parser.add_argument('--device', type=str, default='cuda')
-
-    # A2C/GAE + losses
-    parser.add_argument('--gamma', type=float, default=0.97)
-    parser.add_argument('--gae-lambda', type=float, default=0.9)
-    parser.add_argument('--value-coef', type=float, default=0.7)
-    parser.add_argument('--grad-clip', type=float, default=1.0)
-
-    # Entropy (multiplicative decay)
-    parser.add_argument('--entropy-coef-start', type=float, default=0.05)
-    parser.add_argument('--entropy-coef-end',   type=float, default=0.005)
-    parser.add_argument('--entropy-coef-decay', type=float, default=0.995)
-
-    # Stabilizers / reward handling
-    parser.add_argument('--normalize-adv', action='store_true', default=True)
-    parser.add_argument('--huber-delta', type=float, default=1.0)
-    parser.add_argument('--value-clip-eps', type=float, default=0.2)
-
-    # MA2C-PA specific knobs
-    parser.add_argument('--advantage-mode', type=str, default='per_agent', choices=['per_agent','team'],
-                        help="Use each agent's reward for GAE (per_agent) or a team reward (team).")
-    parser.add_argument('--team-reward-reduce', type=str, default='mean', choices=['mean','sum'],
-                        help="How to aggregate per-agent rewards when advantage_mode='team'.")
-    parser.add_argument('--normalize-rewards', type=str, default='per_agent', choices=['off','per_agent','global'],
-                        help="Reward normalization: per-agent over time, or global over T*N.")
-    parser.add_argument('--reward-scale', type=float, default=1.0)
-
-    # Nets/opt
-    parser.add_argument('--hidden', type=int, default=256)
-    parser.add_argument('--lr-actor', type=float, default=3e-4)
-    parser.add_argument('--lr-critic', type=float, default=1e-3)
-
-    return parser.parse_args()
 
 
 if __name__ == "__main__":

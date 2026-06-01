@@ -1,5 +1,4 @@
 from __future__ import annotations
-import argparse
 from typing import List, Dict, Optional, Tuple
 import numpy as np
 import torch
@@ -11,7 +10,7 @@ from datetime import datetime
 from marl_utils.models import RecurrentQNet  # expects forward([B,T,O], hidden) -> ([B,T,A], new_hidden)
 from marl_utils.replay_buffers import JointSequenceReplay
 from marl_utils.network_update import vdn_update_lstm
-from marl_utils.common import set_global_seed, EvalHistory, clear_eval_history
+from marl_utils.common import parse_args, set_global_seed, EvalHistory, clear_eval_history
 from env_builder import build_train_env, get_or_create_eval_pool
 
 # --------- evaluation (decentralized greedy with 1-step LSTM unroll) ----------
@@ -158,7 +157,7 @@ def run_training(args):
         if total_steps >= args.warmup_steps and len(replay) > 0:
             losses = []
             for _ in range(args.updates_per_ep):
-                S, A, R, NS, D, M = replay.sample(args.batch_size, args.seq_len)
+                S, A, R, NS, D, M = replay.sample(args.batch_size_seq, args.seq_len)
                 loss = vdn_update_lstm(
                     device=device,
                     online_q=online_q,
@@ -193,40 +192,6 @@ def run_training(args):
 
     env.close()
 
-# ------------------------------------------------------------
-def parse_args():
-    p = argparse.ArgumentParser("CTDE VDN (LSTM, SHARED) — Train on Random Flows, Eval on Fixed Trips")
-    p.add_argument('--grid-n', type=int, default=3)
-    p.add_argument('--episodes', type=int, default=200)
-    p.add_argument('--eval-every', type=int, default=5)
-    p.add_argument('--episode-steps', type=int, default=100)
-    p.add_argument('--sumo-steps-per-env-step', type=int, default=5)
-    p.add_argument('--seed', type=int, default=42)
-    p.add_argument('--gamma', type=float, default=0.99)
-    p.add_argument('--gui', action='store_true')
-    p.add_argument('--gui-delay-ms', type=int, default=0)
-    p.add_argument('--logdir', type=str, default='logs')
-    p.add_argument('--device', type=str, default='cuda')
-
-    # LSTM model
-    p.add_argument('--hidden', type=int, default=128)
-    p.add_argument('--lr', type=float, default=1e-4)
-
-    # Exploration
-    p.add_argument('--eps-start', type=float, default=0.5)
-    p.add_argument('--eps-end', type=float, default=0.05)
-    p.add_argument('--eps-decay', type=float, default=0.998)
-
-    # Replay/sequence training
-    p.add_argument('--replay-size', type=int, default=100000)
-    p.add_argument('--warmup-steps', type=int, default=500)
-    p.add_argument('--batch-size', type=int, default=16)
-    p.add_argument('--seq-len', type=int, default=8)
-    p.add_argument('--burn-in', type=int, default=4)
-    p.add_argument('--updates-per-ep', type=int, default=32)
-    p.add_argument('--tau', type=float, default=0.005)
-    p.add_argument('--rb-seed', type=int, default=1234)
-    return p.parse_args()
 
 if __name__ == "__main__":
     run_training(parse_args())

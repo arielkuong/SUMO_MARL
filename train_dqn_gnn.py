@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse
 from typing import List
 import numpy as np
 import torch
@@ -11,6 +10,7 @@ from marl_utils.models import GNNPolicyQ
 from marl_utils.replay_buffers import GlobalReplayBuffer
 from marl_utils.network_update import dqn_update_shared_gnn, soft_update
 from marl_utils.common import (
+    parse_args,
     set_global_seed,
     build_grid_edge_index,
     EvalHistory,
@@ -102,8 +102,8 @@ def run_training(args):
     action_dim = train_env.action_spaces[agent_id_list[0]].n
 
     # Shared GNN Q-networks (online + target)
-    shared_q_network = GNNPolicyQ(node_dim=observation_dim, actions=action_dim, hidden=args.hidden, layers=2).to(compute_device)
-    target_q_network = GNNPolicyQ(node_dim=observation_dim, actions=action_dim, hidden=args.hidden, layers=2).to(compute_device)
+    shared_q_network = GNNPolicyQ(node_dim=observation_dim, actions=action_dim, hidden=args.hidden, layers=args.gnn_layers).to(compute_device)
+    target_q_network = GNNPolicyQ(node_dim=observation_dim, actions=action_dim, hidden=args.hidden, layers=args.gnn_layers).to(compute_device)
     target_q_network.load_state_dict(shared_q_network.state_dict())
     target_q_network.eval()
 
@@ -203,34 +203,6 @@ def run_training(args):
             print(f"[ep {episode_idx}] total steps={total_env_steps_collected} (warming up) eps={exploration_epsilon:.3f}")
 
     train_env.close()
-
-
-def parse_args():
-    parser = argparse.ArgumentParser("IDQN (GNN, SHARED) — Train on Random Flows, Eval on Fixed Trips")
-    parser.add_argument('--grid-n', type=int, default=3, help='Core grid size N (NxN traffic lights)')
-    parser.add_argument('--episodes', type=int, default=200)
-    parser.add_argument('--eval-every', type=int, default=5)
-    parser.add_argument('--episode-steps', type=int, default=100)
-    parser.add_argument('--sumo-steps-per-env-step', type=int, default=5)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--gui', action='store_true')
-    parser.add_argument('--gui-delay-ms', type=int, default=0)
-    parser.add_argument('--logdir', type=str, default='logs')
-    parser.add_argument('--device', type=str, default='cuda')
-
-    parser.add_argument('--hidden', type=int, default=128)   # GNN hidden width
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--eps-start', type=float, default=0.5)
-    parser.add_argument('--eps-end', type=float, default=0.05)
-    parser.add_argument('--eps-decay', type=float, default=0.998)
-    parser.add_argument('--replay-size', type=int, default=100000)
-    parser.add_argument('--warmup-steps', type=int, default=500)
-    parser.add_argument('--batch-size', type=int, default=128)   # smaller default—GNN forward is heavier
-    parser.add_argument('--updates-per-ep', type=int, default=32)
-    parser.add_argument('--tau', type=float, default=0.005)
-    parser.add_argument('--rb-seed', type=int, default=1234)
-    return parser.parse_args()
 
 
 if __name__ == "__main__":

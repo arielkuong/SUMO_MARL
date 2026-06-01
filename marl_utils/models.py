@@ -2,6 +2,7 @@
 from __future__ import annotations
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Tuple, Optional
 
 # =================================== MLP Model ===================================
@@ -195,6 +196,86 @@ class GNNLSTMPolicyQ(nn.Module):
     ):
         Q_seq, new_hidden = self.forward(X_t.unsqueeze(1), edge_index, hidden)  # -> [B,1,N,A]
         return Q_seq[:, 0], new_hidden
+
+# ====================================== QMIX mixer for CTDE =========================================
+class QMIXMixer(nn.Module):
+    """
+    QMIX mixing network.
+
+    Inputs:
+        agent_qs: [B, N]
+            Selected per-agent Q-values Q_i(o_i, a_i)
+
+        states: [B, state_dim]
+            Centralised training state, e.g. flattened [o_1, ..., o_N]
+
+    Output:
+        q_tot: [B]
+            Mixed joint action-value Q_tot
+    """
+
+    def __init__(
+        self,
+        num_agents: int,
+        state_dim: int,
+        mixing_embed_dim: int = 32,
+        hypernet_embed_dim: int = 64,
+    ):
+        super().__init__()
+
+        self.num_agents = num_agents
+        self.state_dim = state_dim
+        self.mixing_embed_dim = mixing_embed_dim
+
+        # First-layer hypernetwork: produces weights from global state
+        self.hyper_w_1 = nn.Sequential(
+            nn.Linear(state_dim, hypernet_embed_dim),
+            nn.ReLU(),
+            nn.Linear(hypernet_embed_dim, num_agents * mixing_embed_dim),
+        )
+
+        self.hyper_b_1 = nn.Linear(state_dim, mixing_embed_dim)
+
+        # Final-layer hypernetwork
+        self.hyper_w_final = nn.Sequential(
+            nn.Linear(state_dim, hypernet_embed_dim),
+            nn.ReLU(),
+            nn.Linear(hypernet_embed_dim, mixing_embed_dim),
+        )
+
+        # State-dependent bias V(s)
+        self.V = nn.Sequential(
+            nn.Linear(state_dim, mixing_embed_dim),
+            nn.ReLU(),
+            nn.Linear(mixing_embed_dim, 1),
+        )
+
+    def forward(self, agent_qs: torch.Tensor, states: torch.Tensor) -> torch.Tensor:
+        """
+        agent_qs: [B, N]
+        states:   [B, state_dim]
+        """
+        B = agent_qs.shape[0]
+
+        # Enforce monotonicity by making mixer weights non-negative
+        w1 = torch.abs(self.hyper_w_1(states))
+        b1 = self.hyper_b_1(states)
+
+        w1 = w1.view(B, self.num_agents, self.mixing_embed_dim)
+        b1 = b1.view(B, 1, self.mixing_embed_dim)
+
+        agent_qs = agent_qs.view(B, 1, self.num_agents)
+
+        hidden = nn.functional.elu(torch.bmm(agent_qs, w1) + b1)  # [B, 1, mixing_embed_dim]
+
+        w_final = torch.abs(self.hyper_w_final(states))
+        w_final = w_final.view(B, self.mixing_embed_dim, 1)
+
+        v = self.V(states).view(B, 1, 1)
+
+        q_tot = torch.bmm(hidden, w_final) + v  # [B, 1, 1]
+
+        return q_tot.view(B)
 
 # =================================== A2C MLP Models ==================================
 

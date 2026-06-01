@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse
 from typing import Dict, List
 
 import numpy as np
@@ -11,7 +10,12 @@ from datetime import datetime
 from marl_utils.models import QNetMLP
 from marl_utils.replay_buffers import Transition, ReplayBuffer
 from marl_utils.network_update import dqn_update, soft_update
-from marl_utils.common import set_global_seed, EvalHistory, clear_eval_history
+from marl_utils.common import (
+    parse_args,
+    set_global_seed,
+    EvalHistory,
+    clear_eval_history
+)
 from env_builder import build_train_env, get_or_create_eval_pool
 
 # --------- evaluation (greedy over cached fixed-route envs) ----------
@@ -189,36 +193,6 @@ def run_training(args):
 
 
     train_env.close()
-
-
-def parse_args():
-    parser = argparse.ArgumentParser("IDQN (MLP, SHARED) — Train on Random Flows, Eval on Fixed Trips")
-    parser.add_argument('--grid-n', type=int, default=3, help='Core grid size N (NxN traffic lights)')
-    parser.add_argument('--episodes', type=int, default=200)
-    parser.add_argument('--eval-every', type=int, default=5)
-    parser.add_argument('--episode-steps', type=int, default=100)
-    parser.add_argument('--sumo-steps-per-env-step', type=int, default=5)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--gui', action='store_true')
-    parser.add_argument('--gui-delay-ms', type=int, default=0)
-    parser.add_argument('--logdir', type=str, default='logs')
-    parser.add_argument('--device', type=str, default='cuda')
-
-    parser.add_argument('--hidden', type=int, default=128)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--eps-start', type=float, default=0.5)
-    parser.add_argument('--eps-end', type=float, default=0.05)
-    parser.add_argument('--eps-decay', type=float, default=0.998)
-    parser.add_argument('--replay-size', type=int, default=100000)
-    parser.add_argument('--warmup-steps', type=int, default=500)
-    parser.add_argument('--batch-size', type=int, default=128)
-    parser.add_argument('--updates-per-ep', type=int, default=32)
-    parser.add_argument('--tau', type=float, default=0.005)
-    # parser.add_argument('--target-sync-ep', type=int, default=2)
-    parser.add_argument('--rb-seed', type=int, default=1234)
-    return parser.parse_args()
-
 
 if __name__ == "__main__":
     run_training(parse_args())

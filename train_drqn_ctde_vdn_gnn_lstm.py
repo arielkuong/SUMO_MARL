@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse
 from typing import List, Dict, Tuple
-
 import numpy as np
 import torch
 import torch.optim as optim
@@ -11,6 +9,7 @@ from datetime import datetime
 from marl_utils.models import GNNLSTMPolicyQ
 from marl_utils.network_update import vdn_update_gnn_lstm, soft_update
 from marl_utils.common import (
+    parse_args,
     set_global_seed,
     build_grid_edge_index,
     EvalHistory,
@@ -172,7 +171,7 @@ def run_training(args):
             losses = []
             for _ in range(args.updates_per_ep):
                 # Sample sequences of length L (pads repeat final frame; done=1 on pads)
-                S, A, R, NS, D = replay.sample(args.batch_size, args.seq_len)  # [B,L,N,O], [B,L,N], ..., [B,L]
+                S, A, R, NS, D = replay.sample(args.batch_size_seq, args.seq_len)  # [B,L,N,O], [B,L,N], ..., [B,L]
                 loss_val = vdn_update_gnn_lstm(
                     device=device,
                     gnnlstm_online_q=online_q,
@@ -205,43 +204,6 @@ def run_training(args):
             print(f"[ep {ep_idx}] total steps={total_steps} (warming up) eps={eps:.3f}")
 
     train_env.close()
-
-
-# ------------------ CLI ------------------
-def parse_args():
-    parser = argparse.ArgumentParser("CTDE VDN (GNN+LSTM, SHARED, replayed sequences)")
-    parser.add_argument('--grid-n', type=int, default=3)
-    parser.add_argument('--episodes', type=int, default=200)
-    parser.add_argument('--eval-every', type=int, default=5)
-    parser.add_argument('--episode-steps', type=int, default=100)
-    parser.add_argument('--sumo-steps-per-env-step', type=int, default=5)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--gui', action='store_true')
-    parser.add_argument('--gui-delay-ms', type=int, default=0)
-    parser.add_argument('--logdir', type=str, default='logs')
-    parser.add_argument('--device', type=str, default='cuda')
-
-    # GNN+LSTM & opt
-    parser.add_argument('--hidden', type=int, default=128)
-    parser.add_argument('--lr', type=float, default=1e-4)
-
-    # Exploration
-    parser.add_argument('--eps-start', type=float, default=0.5)
-    parser.add_argument('--eps-end', type=float, default=0.05)
-    parser.add_argument('--eps-decay', type=float, default=0.998)
-
-    # Replay / recurrent training
-    parser.add_argument('--replay-size', type=int, default=100000)
-    parser.add_argument('--warmup-steps', type=int, default=500)
-    parser.add_argument('--batch-size', type=int, default=16)
-    parser.add_argument('--seq-len', type=int, default=8)
-    parser.add_argument('--burn-in', type=int, default=4)
-    parser.add_argument('--updates-per-ep', type=int, default=32)
-    parser.add_argument('--tau', type=float, default=0.005)
-    parser.add_argument('--rb-seed', type=int, default=1234)
-
-    return parser.parse_args()
 
 
 if __name__ == "__main__":

@@ -365,6 +365,100 @@ def vdn_update_mlp(
 
     return float(loss.item())
 
+# ============================= CTDE-specific: QMIX update (Double-DQN) =============================
+def qmix_update_mlp(
+    device: torch.device,
+    online_q: QNetMLP,
+    target_q: QNetMLP,
+    online_mixer: QMIXMixer,
+    target_mixer: QMIXMixer,
+    optimizer: optim.Optimizer,
+    batch_tuple,
+    gamma: float = 0.99,
+    double_dqn: bool = True,
+    grad_clip: float = 1.0,
+) -> float:
+    """
+    QMIX update with Double-DQN target.
+
+    Inputs from JointReplayBuffer.sample:
+        states      : [B, N, O]
+        actions     : [B, N]
+        rewards     : [B, N]
+        next_states : [B, N, O]
+        dones       : [B]
+
+    This implementation uses flattened joint observations as the QMIX global state:
+        global_state = concat(o_1, ..., o_N)
+    """
+
+    S, A, R, NS, D = batch_tuple
+    B, N, O = S.shape
+
+    S_t = torch.as_tensor(S, device=device, dtype=torch.float32)       # [B, N, O]
+    NS_t = torch.as_tensor(NS, device=device, dtype=torch.float32)     # [B, N, O]
+    A_t = torch.as_tensor(A, device=device, dtype=torch.long)          # [B, N]
+    R_t = torch.as_tensor(R, device=device, dtype=torch.float32)       # [B, N]
+    D_t = torch.as_tensor(D, device=device, dtype=torch.float32)       # [B]
+
+    # Global state for QMIX mixer.
+    # If your env has a true global state, use that instead.
+    global_state = S_t.view(B, N * O)          # [B, N*O]
+    next_global_state = NS_t.view(B, N * O)    # [B, N*O]
+
+    # Flatten per-agent observations for shared Q network
+    S_flat = S_t.view(B * N, O)                # [B*N, O]
+    NS_flat = NS_t.view(B * N, O)              # [B*N, O]
+    A_flat = A_t.view(B * N)                   # [B*N]
+
+    # Current per-agent selected Q-values
+    q_all = online_q(S_flat)                   # [B*N, A_dim]
+    q_taken = q_all.gather(1, A_flat.view(-1, 1)).squeeze(1)
+    q_taken = q_taken.view(B, N)               # [B, N]
+
+    # QMIX centralised mixing
+    q_tot = online_mixer(q_taken, global_state)  # [B]
+
+    with torch.no_grad():
+        q_next_online = online_q(NS_flat).view(B, N, -1)  # [B, N, A_dim]
+        q_next_target = target_q(NS_flat).view(B, N, -1)  # [B, N, A_dim]
+
+        if double_dqn:
+            # Action selection using online network
+            next_actions = q_next_online.argmax(dim=-1)  # [B, N]
+
+            # Action evaluation using target network
+            q_next_taken = q_next_target.gather(
+                -1,
+                next_actions.unsqueeze(-1)
+            ).squeeze(-1)  # [B, N]
+        else:
+            q_next_taken = q_next_target.max(dim=-1).values  # [B, N]
+
+        # Target QMIX mixing
+        q_next_tot = target_mixer(q_next_taken, next_global_state)  # [B]
+
+        # Team reward.
+        # Keep this as sum if your reward_dict contains local rewards.
+        # If each agent already receives the same global reward, use mean or just R_t[:, 0].
+        R_team = R_t.sum(dim=1)  # [B]
+
+        target = R_team + (1.0 - D_t) * gamma * q_next_tot  # [B]
+
+    loss = nn.functional.smooth_l1_loss(q_tot, target)
+
+    optimizer.zero_grad()
+    loss.backward()
+
+    nn.utils.clip_grad_norm_(
+        list(online_q.parameters()) + list(online_mixer.parameters()),
+        grad_clip,
+    )
+
+    optimizer.step()
+
+    return float(loss.item())
+
 # ================= CTDE-specific: VDN update for LSTM (Double-DQN) ===================
 
 def vdn_update_lstm(
@@ -457,6 +551,274 @@ def vdn_update_lstm(
 
     return float(loss.item())
 
+# ================= CTDE-specific: QMIX update for LSTM (Double-DQN) ===================
+def qmix_update_lstm(
+    device: torch.device,
+    online_q: "RecurrentQNet",
+    target_q: "RecurrentQNet",
+    online_mixer: nn.Module,
+    target_mixer: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    batch_tuple,
+    gamma: float = 0.99,
+    burn_in: int = 6,
+    double_dqn: bool = True,
+    grad_clip: float = 1.0,
+) -> float:
+    """
+    QMIX update for DRQN/LSTM per-agent Q_i.
+
+    Inputs from JointSequenceReplay.sample:
+
+        S  : [B, L, N, O]
+        A  : [B, L, N]
+        R  : [B, L, N]
+        NS : [B, L, N, O]
+        D  : [B, L]
+        M  : [B, L]
+
+    where:
+        B = sequence batch size
+        L = sampled sequence length
+        N = number of agents
+        O = local observation dimension
+
+    The recurrent Q-network produces per-agent Q_i values.
+
+    QMIX then mixes:
+
+        [Q_1, Q_2, ..., Q_N]
+
+    into:
+
+        Q_tot
+
+    using a centralised state:
+
+        s_t = concat(o_1, ..., o_N)
+    """
+
+    S, A, R, NS, D, M = batch_tuple
+
+    S = torch.as_tensor(
+        S,
+        device=device,
+        dtype=torch.float32,
+    )                                                               # [B, L, N, O]
+
+    A = torch.as_tensor(
+        A,
+        device=device,
+        dtype=torch.long,
+    )                                                               # [B, L, N]
+
+    R = torch.as_tensor(
+        R,
+        device=device,
+        dtype=torch.float32,
+    )                                                               # [B, L, N]
+
+    NS = torch.as_tensor(
+        NS,
+        device=device,
+        dtype=torch.float32,
+    )                                                               # [B, L, N, O]
+
+    D = torch.as_tensor(
+        D,
+        device=device,
+        dtype=torch.float32,
+    )                                                               # [B, L]
+
+    M = torch.as_tensor(
+        M,
+        device=device,
+        dtype=torch.float32,
+    )                                                               # [B, L]
+
+    B, L, N, O = S.shape
+
+    burn = int(burn_in)
+
+    if burn >= L:
+        burn = max(0, L - 1)
+
+    # ------------------------------------------------------------------
+    # Burn-in recurrent hidden states
+    # ------------------------------------------------------------------
+
+    h_online = None
+    h_target = None
+
+    if burn > 0:
+        with torch.no_grad():
+            # Warm online hidden using S.
+            _, h_online = online_q(
+                S[:, :burn].reshape(B * N, burn, O),
+                None,
+            )
+
+            # Warm target hidden using NS.
+            _, h_target = target_q(
+                NS[:, :burn].reshape(B * N, burn, O),
+                None,
+            )
+
+    Tw = L - burn
+
+    q_tot_list = []
+    target_tot_list = []
+
+    # ------------------------------------------------------------------
+    # Unroll from burn-in point
+    # ------------------------------------------------------------------
+
+    for t in range(Tw):
+        tt = burn + t
+
+        s_t = S[:, tt]                                               # [B, N, O]
+        ns_t_full = NS[:, tt]                                        # [B, N, O]
+
+        s_t_flat = s_t.reshape(B * N, 1, O)                          # [B*N, 1, O]
+        ns_t_flat = ns_t_full.reshape(B * N, 1, O)                   # [B*N, 1, O]
+
+        a_t = A[:, tt].reshape(B * N)                                # [B*N]
+        r_t = R[:, tt]                                               # [B, N]
+        d_t = D[:, tt]                                               # [B]
+
+        # Centralised states for QMIX mixer.
+        global_state_t = s_t.reshape(B, N * O)                       # [B, N*O]
+        next_global_state_t = ns_t_full.reshape(B, N * O)            # [B, N*O]
+
+        # --------------------------------------------------------------
+        # Current Q_tot
+        # --------------------------------------------------------------
+
+        q_now_seq, h_online = online_q(s_t_flat, h_online)           # [B*N, 1, A]
+        q_now = q_now_seq.squeeze(1)                                 # [B*N, A]
+
+        q_taken_nodes = q_now.gather(
+            1,
+            a_t.unsqueeze(1),
+        ).squeeze(1)                                                 # [B*N]
+
+        q_taken_nodes = q_taken_nodes.view(B, N)                     # [B, N]
+
+        q_tot = online_mixer(
+            q_taken_nodes,
+            global_state_t,
+        )                                                           # [B]
+
+        q_tot_list.append(q_tot)
+
+        # --------------------------------------------------------------
+        # Target Q_tot
+        # --------------------------------------------------------------
+
+        with torch.no_grad():
+            q_next_online_seq, _ = online_q(
+                ns_t_flat,
+                h_online,
+            )                                                       # [B*N, 1, A]
+
+            q_next_target_seq, h_target = target_q(
+                ns_t_flat,
+                h_target,
+            )                                                       # [B*N, 1, A]
+
+            q_next_online = q_next_online_seq.squeeze(1)             # [B*N, A]
+            q_next_target = q_next_target_seq.squeeze(1)             # [B*N, A]
+
+            if double_dqn:
+                # Action selection using online recurrent Q-network.
+                next_actions = torch.argmax(q_next_online, dim=-1)   # [B*N]
+            else:
+                next_actions = torch.argmax(q_next_target, dim=-1)   # [B*N]
+
+            # Action evaluation using target recurrent Q-network.
+            q_next_taken_nodes = q_next_target.gather(
+                1,
+                next_actions.unsqueeze(1),
+            ).squeeze(1)                                             # [B*N]
+
+            q_next_taken_nodes = q_next_taken_nodes.view(B, N)       # [B, N]
+
+            q_next_tot = target_mixer(
+                q_next_taken_nodes,
+                next_global_state_t,
+            )                                                       # [B]
+
+            # Team reward = sum over agents.
+            r_team = r_t.sum(dim=1)                                  # [B]
+
+            target_tot = r_team + (1.0 - d_t) * gamma * q_next_tot   # [B]
+
+            target_tot_list.append(target_tot)
+
+        # --------------------------------------------------------------
+        # Reset recurrent hidden states where the team episode is done
+        # --------------------------------------------------------------
+
+        if h_online is not None:
+            keep = (1.0 - d_t).view(1, B, 1, 1)                      # [1, B, 1, 1]
+
+            h0 = h_online[0].view(1, B, N, -1)
+            c0 = h_online[1].view(1, B, N, -1)
+
+            h0 = h0 * keep
+            c0 = c0 * keep
+
+            h_online = (
+                h0.reshape(1, B * N, -1),
+                c0.reshape(1, B * N, -1),
+            )
+
+        if h_target is not None:
+            keep = (1.0 - d_t).view(1, B, 1, 1)                      # [1, B, 1, 1]
+
+            h1 = h_target[0].view(1, B, N, -1)
+            c1 = h_target[1].view(1, B, N, -1)
+
+            h1 = h1 * keep
+            c1 = c1 * keep
+
+            h_target = (
+                h1.reshape(1, B * N, -1),
+                c1.reshape(1, B * N, -1),
+            )
+
+    # ------------------------------------------------------------------
+    # Masked TD loss over post-burn-in timesteps
+    # ------------------------------------------------------------------
+
+    Q_tot = torch.stack(q_tot_list, dim=1)                           # [B, Tw]
+    Target_tot = torch.stack(target_tot_list, dim=1)                 # [B, Tw]
+
+    M_w = M[:, burn:]                                                # [B, Tw]
+
+    td_loss = nn.functional.smooth_l1_loss(
+        Q_tot,
+        Target_tot,
+        reduction="none",
+    )                                                               # [B, Tw]
+
+    td_loss = td_loss * M_w
+
+    denom = M_w.sum().clamp_min(1.0)
+    loss = td_loss.sum() / denom
+
+    optimizer.zero_grad()
+    loss.backward()
+
+    torch.nn.utils.clip_grad_norm_(
+        list(online_q.parameters()) + list(online_mixer.parameters()),
+        grad_clip,
+    )
+
+    optimizer.step()
+
+    return float(loss.item())
+
 # =================== CTDE-specific: VDN update (Double-DQN) — GNN ======================
 def vdn_update_gnn(
     device: torch.device,
@@ -523,6 +885,163 @@ def vdn_update_gnn(
     optimizer.step()
 
     return float(loss.item())
+
+
+# =================== CTDE-specific: QMIX update (Double-DQN) — GNN ======================
+def qmix_update_gnn(
+    device: torch.device,
+    gnn_online_q: nn.Module,
+    gnn_target_q: nn.Module,
+    online_mixer: nn.Module,
+    target_mixer: nn.Module,
+    optimizer: optim.Optimizer,
+    batch_tuple,
+    graph_edge_index: torch.Tensor,
+    gamma: float = 0.99,
+    double_dqn: bool = True,
+    grad_clip: float = 1.0,
+) -> float:
+    """
+    QMIX update with GNN per-agent Q_i and Double-DQN targets.
+
+    Shapes from JointReplayBuffer.sample:
+
+        S  : [B, N, O]
+        A  : [B, N]
+        R  : [B, N]
+        NS : [B, N, O]
+        D  : [B]
+
+    The GNN processes a batched disconnected graph with B copies of the same
+    traffic-signal topology.
+
+    The QMIX mixer receives:
+
+        q_taken:     [B, N]
+        global_state [B, N * O]
+
+    where global_state is the flattened joint observation.
+    """
+
+    S, A, R, NS, D = batch_tuple
+    B, N, O = S.shape
+
+    S_t = torch.as_tensor(
+        S,
+        device=device,
+        dtype=torch.float32,
+    )                                                               # [B, N, O]
+
+    NS_t = torch.as_tensor(
+        NS,
+        device=device,
+        dtype=torch.float32,
+    )                                                               # [B, N, O]
+
+    A_t = torch.as_tensor(
+        A,
+        device=device,
+        dtype=torch.long,
+    )                                                               # [B, N]
+
+    R_t = torch.as_tensor(
+        R,
+        device=device,
+        dtype=torch.float32,
+    )                                                               # [B, N]
+
+    D_t = torch.as_tensor(
+        D,
+        device=device,
+        dtype=torch.float32,
+    )                                                               # [B]
+
+    # Centralised states for QMIX.
+    global_state = S_t.reshape(B, N * O)                            # [B, N*O]
+    next_global_state = NS_t.reshape(B, N * O)                      # [B, N*O]
+
+    # Flatten batch and node dimensions for GNN.
+    S_flat = S_t.reshape(B * N, O)                                  # [B*N, O]
+    NS_flat = NS_t.reshape(B * N, O)                                # [B*N, O]
+    A_flat = A_t.reshape(B * N)                                     # [B*N]
+
+    # Build B disconnected copies of the same traffic-signal graph.
+    batched_edge_index = build_batched_edge_index(
+        graph_edge_index.to(device),
+        batch_size=B,
+        num_nodes=N,
+    )                                                               # [2, B*E]
+
+    # ------------------------------------------------------------------
+    # Current Q_tot
+    # ------------------------------------------------------------------
+
+    q_all = gnn_online_q(S_flat, batched_edge_index)                 # [B*N, A_dim]
+
+    q_taken = q_all.gather(
+        1,
+        A_flat.view(-1, 1),
+    ).squeeze(1)                                                     # [B*N]
+
+    q_taken = q_taken.view(B, N)                                     # [B, N]
+
+    q_tot = online_mixer(q_taken, global_state)                      # [B]
+
+    # ------------------------------------------------------------------
+    # Target Q_tot
+    # ------------------------------------------------------------------
+
+    with torch.no_grad():
+        q_next_online = gnn_online_q(
+            NS_flat,
+            batched_edge_index,
+        ).view(B, N, -1)                                             # [B, N, A_dim]
+
+        q_next_target = gnn_target_q(
+            NS_flat,
+            batched_edge_index,
+        ).view(B, N, -1)                                             # [B, N, A_dim]
+
+        if double_dqn:
+            # Select next actions using the online GNN Q-network.
+            next_actions = q_next_online.argmax(dim=-1)              # [B, N]
+
+            # Evaluate selected actions using the target GNN Q-network.
+            q_next_taken = q_next_target.gather(
+                -1,
+                next_actions.unsqueeze(-1),
+            ).squeeze(-1)                                            # [B, N]
+        else:
+            q_next_taken = q_next_target.max(dim=-1).values          # [B, N]
+
+        q_next_tot = target_mixer(
+            q_next_taken,
+            next_global_state,
+        )                                                           # [B]
+
+        # Team reward: sum over per-agent rewards.
+        R_team = R_t.sum(dim=1)                                      # [B]
+
+        target = R_team + (1.0 - D_t) * gamma * q_next_tot           # [B]
+
+    # ------------------------------------------------------------------
+    # Loss and update
+    # ------------------------------------------------------------------
+
+    loss = nn.functional.smooth_l1_loss(q_tot, target)
+
+    optimizer.zero_grad()
+    loss.backward()
+
+    torch.nn.utils.clip_grad_norm_(
+        list(gnn_online_q.parameters()) + list(online_mixer.parameters()),
+        grad_clip,
+    )
+
+    optimizer.step()
+
+    return float(loss.item())
+
 
 # ============= CTDE-specific: VDN update (Double-DQN) — GNN+LSTM ===============
 def _shift_next_actions_double_dqn(
@@ -603,6 +1122,217 @@ def vdn_update_gnn_lstm(
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     torch.nn.utils.clip_grad_norm_(gnnlstm_online_q.parameters(), grad_clip)
+    optimizer.step()
+
+    return float(loss.item())
+
+# ============= CTDE-specific: QMIX update (Double-DQN) — GNN+LSTM ===============
+def qmix_update_gnn_lstm(
+    device: torch.device,
+    gnnlstm_online_q,
+    gnnlstm_target_q,
+    online_mixer: nn.Module,
+    target_mixer: nn.Module,
+    optimizer: optim.Optimizer,
+    seq_batch,
+    graph_edge_index: torch.Tensor,
+    gamma: float = 0.99,
+    double_dqn: bool = True,
+    burn_in: int = 8,
+    grad_clip: float = 1.0,
+) -> float:
+    """
+    CTDE-QMIX with spatio-temporal GNN-LSTM Q_i.
+
+    Inputs are sequence windows:
+
+        S_seq  : [B, L, N, O]
+        A_seq  : [B, L, N]
+        R_seq  : [B, L, N]
+        NS_seq : [B, L, N, O]
+        D_seq  : [B, L]
+
+    where:
+
+        B = sampled sequence batch size
+        L = sequence length
+        N = number of agents / junctions
+        O = local observation dimension
+
+    The per-agent Q-network is recurrent and graph-based:
+
+        Q_i = GNNLSTMPolicyQ(o_i, graph, h_i)
+
+    QMIX replaces VDN's sum:
+
+        VDN:
+            Q_tot = sum_i Q_i
+
+        QMIX:
+            Q_tot = mixer([Q_1, ..., Q_N], global_state)
+
+    Here global_state is the flattened joint observation:
+
+        global_state_t = concat(o_1, ..., o_N)
+    """
+
+    S, A, R, NS, D = seq_batch
+
+    B, L, N, O = S.shape
+
+    S_t = torch.as_tensor(
+        S,
+        device=device,
+        dtype=torch.float32,
+    )                                                               # [B, L, N, O]
+
+    A_t = torch.as_tensor(
+        A,
+        device=device,
+        dtype=torch.long,
+    )                                                               # [B, L, N]
+
+    R_t = torch.as_tensor(
+        R,
+        device=device,
+        dtype=torch.float32,
+    )                                                               # [B, L, N]
+
+    NS_t = torch.as_tensor(
+        NS,
+        device=device,
+        dtype=torch.float32,
+    )                                                               # [B, L, N, O]
+
+    D_t = torch.as_tensor(
+        D,
+        device=device,
+        dtype=torch.float32,
+    )                                                               # [B, L]
+
+    edge_index = graph_edge_index.to(device)
+
+    burn = int(burn_in)
+
+    if burn >= L:
+        burn = max(0, L - 1)
+
+    # ------------------------------------------------------------------
+    # Online Q over full sequence
+    # ------------------------------------------------------------------
+
+    q_seq, _ = gnnlstm_online_q(
+        S_t,
+        edge_index,
+        hidden=None,
+    )                                                               # [B, L, N, A]
+
+    q_taken = q_seq.gather(
+        -1,
+        A_t.unsqueeze(-1),
+    ).squeeze(-1)                                                    # [B, L, N]
+
+    # Centralised state for QMIX at each timestep.
+    global_states = S_t.reshape(B, L, N * O)                         # [B, L, N*O]
+
+    # Flatten B and L so we can call the standard QMIXMixer.
+    q_taken_flat = q_taken.reshape(B * L, N)                         # [B*L, N]
+    global_states_flat = global_states.reshape(B * L, N * O)         # [B*L, N*O]
+
+    q_tot_flat = online_mixer(
+        q_taken_flat,
+        global_states_flat,
+    )                                                               # [B*L]
+
+    q_tot = q_tot_flat.view(B, L)                                    # [B, L]
+
+    # ------------------------------------------------------------------
+    # Target Q_tot
+    # ------------------------------------------------------------------
+
+    with torch.no_grad():
+        if double_dqn:
+            next_actions = _shift_next_actions_double_dqn(
+                gnnlstm_online_q,
+                NS_t,
+                edge_index,
+            )                                                      # [B, L, N]
+        else:
+            tmp_q, _ = gnnlstm_target_q(
+                NS_t,
+                edge_index,
+                hidden=None,
+            )                                                       # [B, L, N, A]
+
+            next_actions = tmp_q.argmax(dim=-1).long()              # [B, L, N]
+
+        q_next_target_seq, _ = gnnlstm_target_q(
+            NS_t,
+            edge_index,
+            hidden=None,
+        )                                                           # [B, L, N, A]
+
+        q_next_taken = q_next_target_seq.gather(
+            -1,
+            next_actions.unsqueeze(-1),
+        ).squeeze(-1)                                                # [B, L, N]
+
+        next_global_states = NS_t.reshape(B, L, N * O)               # [B, L, N*O]
+
+        q_next_taken_flat = q_next_taken.reshape(B * L, N)           # [B*L, N]
+        next_global_states_flat = next_global_states.reshape(
+            B * L,
+            N * O,
+        )                                                           # [B*L, N*O]
+
+        q_next_tot_flat = target_mixer(
+            q_next_taken_flat,
+            next_global_states_flat,
+        )                                                           # [B*L]
+
+        q_next_tot = q_next_tot_flat.view(B, L)                      # [B, L]
+
+        # Team reward = sum of local rewards.
+        R_team = R_t.sum(dim=-1)                                     # [B, L]
+
+        target = R_team + (1.0 - D_t) * gamma * q_next_tot           # [B, L]
+
+    # ------------------------------------------------------------------
+    # Mask out burn-in steps
+    # ------------------------------------------------------------------
+
+    if burn > 0:
+        mask = torch.zeros(
+            (B, L),
+            device=device,
+            dtype=torch.float32,
+        )
+
+        mask[:, burn:] = 1.0
+    else:
+        mask = torch.ones(
+            (B, L),
+            device=device,
+            dtype=torch.float32,
+        )
+
+    td = nn.functional.smooth_l1_loss(
+        q_tot,
+        target,
+        reduction="none",
+    )                                                               # [B, L]
+
+    loss = (td * mask).sum() / mask.sum().clamp_min(1.0)
+
+    optimizer.zero_grad(set_to_none=True)
+
+    loss.backward()
+
+    torch.nn.utils.clip_grad_norm_(
+        list(gnnlstm_online_q.parameters()) + list(online_mixer.parameters()),
+        grad_clip,
+    )
+
     optimizer.step()
 
     return float(loss.item())

@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse
 from typing import Dict, List, Optional, Tuple
-
 import numpy as np
 import torch
 import torch.optim as optim
@@ -11,7 +9,12 @@ from datetime import datetime
 from marl_utils.models import RecurrentQNet
 from marl_utils.replay_buffers import AgentEpisode, SequenceReplay
 from marl_utils.network_update import drqn_update, soft_update
-from marl_utils.common import set_global_seed, EvalHistory, clear_eval_history
+from marl_utils.common import (
+    parse_args,
+    set_global_seed,
+    EvalHistory,
+    clear_eval_history
+)
 from env_builder import build_train_env, get_or_create_eval_pool
 
 # --------------------------- Evaluation (shared LSTM) ---------------------------
@@ -110,7 +113,7 @@ def run_training(args):
     optimizer_q = optim.Adam(shared_q_net.parameters(), lr=args.lr, weight_decay=1e-5)
 
     # One shared sequence replay (stores per-agent trajectories as episodes)
-    seq_replay = SequenceReplay(capacity_steps=args.replay_steps, observation_dim=obs_dim, seed=args.rb_seed)
+    seq_replay = SequenceReplay(capacity_steps=args.replay_size, observation_dim=obs_dim, seed=args.rb_seed)
 
     exploration_epsilon = args.eps_start
     total_steps_collected = 0
@@ -185,7 +188,7 @@ def run_training(args):
             for _ in range(args.updates_per_ep):
                 if len(seq_replay) == 0:
                     break
-                batch = seq_replay.sample(batch_size=args.batch_size, seq_len=args.seq_len)
+                batch = seq_replay.sample(batch_size=args.batch_size_seq, seq_len=args.seq_len)
                 loss_val = drqn_update(
                     device=compute_device,
                     batch=batch,
@@ -221,44 +224,6 @@ def run_training(args):
         #     target_q_net.load_state_dict(shared_q_net.state_dict())
 
     train_env.close()
-
-
-# --------------------------- Args & Main ---------------------------
-
-def parse_args():
-    parser = argparse.ArgumentParser("IDRQN (LSTM, SHARED) — Train on Random Flows, Eval on Fixed Trips")
-    parser.add_argument('--grid-n', type=int, default=3, help='Core grid size N (NxN traffic lights)')
-    parser.add_argument('--episodes', type=int, default=200)
-    parser.add_argument('--eval-every', type=int, default=5)
-    parser.add_argument('--episode-steps', type=int, default=100)
-    parser.add_argument('--sumo-steps-per-env-step', type=int, default=5)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--gui', action='store_true')
-    parser.add_argument('--gui-delay-ms', type=int, default=0)
-    parser.add_argument('--logdir', type=str, default='logs')
-    parser.add_argument('--device', type=str, default='cuda')
-
-    # model / opt
-    parser.add_argument('--hidden', type=int, default=128)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--tau', type=float, default=0.005)
-
-    # exploration
-    parser.add_argument('--eps-start', type=float, default=0.5)
-    parser.add_argument('--eps-end', type=float, default=0.05)
-    parser.add_argument('--eps-decay', type=float, default=0.998)  # slower decay often helps DRQN
-
-    # replay / updates
-    parser.add_argument('--replay-steps', type=int, default=100000, help='Capacity in timesteps for sequence replay')
-    parser.add_argument('--rb-seed', type=int, default=1234)
-    parser.add_argument('--warmup-steps', type=int, default=500)
-    parser.add_argument('--batch-size', type=int, default=16)
-    parser.add_argument('--seq-len', type=int, default=8)
-    parser.add_argument('--burn-in', type=int, default=4)
-    parser.add_argument('--updates-per-ep', type=int, default=32)
-
-    return parser.parse_args()
 
 
 if __name__ == "__main__":

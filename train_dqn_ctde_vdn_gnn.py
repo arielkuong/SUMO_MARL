@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse
 from typing import List, Dict
 import numpy as np
 import torch
@@ -11,6 +10,7 @@ from marl_utils.models import GNNPolicyQ          # reuse your SimpleAttnMP, GNN
 from marl_utils.replay_buffers import JointReplayBuffer
 from marl_utils.network_update import vdn_update_gnn, soft_update   # <-- new updater you’ll add below
 from marl_utils.common import (
+    parse_args,
     set_global_seed,
     build_grid_edge_index,       # graph over TLS grid (you already have this)
     EvalHistory,
@@ -99,8 +99,8 @@ def run_training(args):
     edge_index = build_grid_edge_index(agent_id_list)  # [2,E] torch.long (no edges across samples)
 
     # Shared per-agent GNN Q_i (CTDE training, decentralized execution)
-    online_q = GNNPolicyQ(node_dim=O, actions=A_dim, hidden=args.hidden, layers=args.layers).to(device)
-    target_q = GNNPolicyQ(node_dim=O, actions=A_dim, hidden=args.hidden, layers=args.layers).to(device)
+    online_q = GNNPolicyQ(node_dim=O, actions=A_dim, hidden=args.hidden, layers=args.gnn_layers).to(device)
+    target_q = GNNPolicyQ(node_dim=O, actions=A_dim, hidden=args.hidden, layers=args.gnn_layers).to(device)
     target_q.load_state_dict(online_q.state_dict())
     target_q.eval()
 
@@ -188,41 +188,6 @@ def run_training(args):
             print(f"[ep {ep_idx}] total steps={total_steps} (warming up) eps={eps:.3f}")
 
     train_env.close()
-
-
-# ------------------ CLI ------------------
-def parse_args():
-    parser = argparse.ArgumentParser("CTDE VDN (GNN, SHARED) — Train on Random Flows, Eval on Fixed Trips")
-    parser.add_argument('--grid-n', type=int, default=3, help='Core grid size N (NxN traffic lights)')
-    parser.add_argument('--episodes', type=int, default=200)
-    parser.add_argument('--eval-every', type=int, default=5)
-    parser.add_argument('--episode-steps', type=int, default=100)
-    parser.add_argument('--sumo-steps-per-env-step', type=int, default=5)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--gui', action='store_true')
-    parser.add_argument('--gui-delay-ms', type=int, default=0)
-    parser.add_argument('--logdir', type=str, default='logs')
-    parser.add_argument('--device', type=str, default='cuda')
-
-    # GNN & opt
-    parser.add_argument('--hidden', type=int, default=128)
-    parser.add_argument('--layers', type=int, default=2)
-    parser.add_argument('--lr', type=float, default=1e-4)
-
-    # Exploration
-    parser.add_argument('--eps-start', type=float, default=0.5)
-    parser.add_argument('--eps-end', type=float, default=0.05)
-    parser.add_argument('--eps-decay', type=float, default=0.998)
-
-    # Replay / updates
-    parser.add_argument('--replay-size', type=int, default=100000)
-    parser.add_argument('--warmup-steps', type=int, default=500)
-    parser.add_argument('--batch-size', type=int, default=128)
-    parser.add_argument('--updates-per-ep', type=int, default=32)
-    parser.add_argument('--tau', type=float, default=0.005)
-    parser.add_argument('--rb-seed', type=int, default=1234)
-    return parser.parse_args()
 
 
 if __name__ == "__main__":

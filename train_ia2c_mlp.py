@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse
 from typing import List, Dict, Tuple
 
 import numpy as np
@@ -12,7 +11,7 @@ from datetime import datetime
 
 from marl_utils.models import ActorMLP, CriticMLP
 from marl_utils.network_update import ia2c_update_mlp
-from marl_utils.common import set_global_seed, EvalHistory, clear_eval_history
+from marl_utils.common import parse_args, set_global_seed, EvalHistory, clear_eval_history
 from env_builder import build_train_env, get_or_create_eval_pool
 
 
@@ -182,45 +181,6 @@ def run_training(args):
                 torch.save(actor.state_dict(), save_path)
 
     train_env.close()
-
-
-def parse_args():
-    parser = argparse.ArgumentParser("IA2C (MLP, SHARED) — Train on Random Flows, Eval on Fixed Trips")
-    parser.add_argument('--grid-n', type=int, default=3)
-    parser.add_argument('--episodes', type=int, default=300)
-    parser.add_argument('--eval-every', type=int, default=10)
-    parser.add_argument('--episode-steps', type=int, default=100)
-    parser.add_argument('--sumo-steps-per-env-step', type=int, default=5)
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--gui', action='store_true')
-    parser.add_argument('--gui-delay-ms', type=int, default=0)
-    parser.add_argument('--logdir', type=str, default='logs')
-    parser.add_argument('--device', type=str, default='cuda')
-
-    # A2C/GAE + losses
-    parser.add_argument('--gamma', type=float, default=0.97)
-    parser.add_argument('--gae-lambda', type=float, default=0.9)
-    parser.add_argument('--value-coef', type=float, default=0.7)
-    parser.add_argument('--grad-clip', type=float, default=1.0)
-
-    # Entropy decay (multiplicative)
-    parser.add_argument('--entropy-coef-start', type=float, default=0.05)
-    parser.add_argument('--entropy-coef-end',   type=float, default=0.005)
-    parser.add_argument('--entropy-coef-decay', type=float, default=0.995)
-
-    # Stabilization knobs
-    parser.add_argument('--normalize-rewards', action='store_true', default=True)
-    parser.add_argument('--reward-scale', type=float, default=1.0)
-    parser.add_argument('--normalize-adv', action='store_true', default=True)
-    parser.add_argument('--huber-delta', type=float, default=1.0)
-    parser.add_argument('--value-clip-eps', type=float, default=0.2)
-
-    # Nets/opt
-    parser.add_argument('--hidden', type=int, default=256)
-    parser.add_argument('--lr-actor', type=float, default=3e-4)
-    parser.add_argument('--lr-critic', type=float, default=1e-3)
-
-    return parser.parse_args()
 
 
 if __name__ == "__main__":

@@ -2,12 +2,84 @@
 from __future__ import annotations
 import numpy as np
 import random
+import argparse
 from pathlib import Path
 import torch
 import torch.nn as nn
 from typing import Dict, Tuple, List
 
 # --------------------------- seed / tensor / env ---------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--grid-n', type=int, default=3, help='Core grid size N (NxN traffic lights)')
+    parser.add_argument('--episodes', type=int, default=100)
+    parser.add_argument('--eval-every', type=int, default=5)
+    parser.add_argument('--episode-steps', type=int, default=200)
+    parser.add_argument('--sumo-steps-per-env-step', type=int, default=5)
+    parser.add_argument('--gui', action='store_true')
+    parser.add_argument('--gui-delay-ms', type=int, default=0)
+    parser.add_argument('--logdir', type=str, default='logs')
+    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--seed', type=int, default=42)
+
+    # model / opt
+    parser.add_argument('--gamma', type=float, default=0.99)
+    parser.add_argument('--hidden', type=int, default=128)
+    parser.add_argument('--gnn-layers', type=int, default=2, help='number of gnn layers only for gnn+lstm structure')
+    parser.add_argument('--lr', type=float, default=1e-4, help='learning rate for off-policy methods')
+    parser.add_argument('--lr-actor', type=float, default=3e-4, help='learning rate for actor of on-policy methods')
+    parser.add_argument('--lr-critic', type=float, default=1e-3, help='learning rate for critic of on-policy methods')
+    parser.add_argument('--tau', type=float, default=0.005)
+
+    # A2C/GAE specific
+    parser.add_argument('--gae-lambda', type=float, default=0.9)
+    parser.add_argument('--value-coef', type=float, default=0.7)
+    parser.add_argument('--grad-clip', type=float, default=1.0)
+
+    # exploration decay
+    parser.add_argument('--eps-start', type=float, default=0.5)
+    parser.add_argument('--eps-end', type=float, default=0.05)
+    parser.add_argument('--eps-decay', type=float, default=0.998)
+
+    # entropy decay
+    parser.add_argument('--entropy-coef-start', type=float, default=0.05)
+    parser.add_argument('--entropy-coef-end',   type=float, default=0.005)
+    parser.add_argument('--entropy-coef-decay', type=float, default=0.995)
+
+    # Stabilization knobs
+    parser.add_argument('--normalize-rewards', action='store_true', default=True)
+    parser.add_argument('--reward-scale', type=float, default=1.0)
+    parser.add_argument('--normalize-adv', action='store_true', default=True)
+    parser.add_argument('--huber-delta', type=float, default=1.0)
+    parser.add_argument('--value-clip-eps', type=float, default=0.2)
+
+    # replay / updates
+    parser.add_argument('--replay-size', type=int, default=100000)
+    parser.add_argument('--warmup-steps', type=int, default=500)
+    parser.add_argument('--batch-size', type=int, default=128, help='batch size for none-sequence replay')
+    parser.add_argument('--batch-size-seq', type=int, default=16, help='batch size for sequence replay')
+    parser.add_argument('--seq-len', type=int, default=8)
+    parser.add_argument('--burn-in', type=int, default=4)
+    parser.add_argument('--updates-per-ep', type=int, default=32)
+    parser.add_argument('--rb-seed', type=int, default=1234)
+
+    # MA2C-PA specific knobs
+    parser.add_argument('--advantage-mode', type=str, default='per_agent', choices=['per_agent','team'],
+                        help="Use each agent's reward for GAE (per_agent) or a team reward (team).")
+    parser.add_argument('--team-reward-reduce', type=str, default='mean', choices=['mean','sum'],
+                        help="How to aggregate per-agent rewards when advantage_mode='team'.")
+    parser.add_argument('--normalize-rewards-mode', type=str, default='per_agent', choices=['off','per_agent','global'],
+                        help="Reward normalization: per-agent over time, or global over T*N.")
+    # parser.add_argument('--reward-scale', type=float, default=1.0)
+
+    # QMIX specific
+    parser.add_argument("--mixing_embed_dim", type=int, default=32)
+    parser.add_argument("--hypernet_embed_dim", type=int, default=64)
+    # parser.add_argument("--grad_clip", type=float, default=1.0)
+
+    return parser.parse_args()
+
 
 def set_global_seed(random_seed: int):
     random.seed(random_seed)

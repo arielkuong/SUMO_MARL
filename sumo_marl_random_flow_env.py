@@ -71,10 +71,10 @@ class SumoGridMARLRandomEnv:
         spacing: float = 150.0,             # meters between core junctions
         fringe_len: float = 150.0,          # meters for fringe stubs
         step_length_internal: float = 1.0,  # SUMO internal time-step (seconds)
-        sumo_steps_per_env_step: int = 10,
-        episode_steps: int = 100,
+        sumo_steps_per_env_step: int = 5,
+        episode_steps: int = 500,
         # Random traffic sections
-        section_count: int = 10,
+        section_count: int = 50,
         # min_routes_per_section: int = 12,
         # max_routes_per_section: int = 60,
         min_flow_rate_vph: float = 100.0,

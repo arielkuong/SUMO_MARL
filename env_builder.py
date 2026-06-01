@@ -56,8 +56,8 @@ class EvalEnvPool:
         for tp in trip_paths:
             envs.append(
                 SumoGridMARLFixedEnv(
-                    gui=False,
-                    gui_delay_ms=0,
+                    gui=args.gui,
+                    gui_delay_ms=args.gui_delay_ms,
                     grid_n=args.grid_n,
                     episode_steps=args.episode_steps,
                     sumo_steps_per_env_step=args.sumo_steps_per_env_step,

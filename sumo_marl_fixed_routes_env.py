@@ -76,7 +76,7 @@ class SumoGridMARLFixedEnv:
         fringe_len: float = 150.0,          # meters for fringe stubs
         step_length_internal: float = 1.0,  # SUMO internal step (s)
         sumo_steps_per_env_step: int = 10,
-        episode_steps: int = 100,
+        episode_steps: int = 500,
         # Fixed-input options (evaluation):
         fixed_routes_file: Optional[str] = None,   # .rou.xml (preferred)
         fixed_trips_file: Optional[str] = None,    # .trips.xml / flows xml (duarouted)

@@ -63,6 +63,10 @@ def main():
         "DRQN (CTDE+LSTM)"         : "vdn_ctde_lstm_shared_seqlen8",
         "DQN (CTDE+GNN)"           : "vdn_ctde_gnn_shared",
         "DRQN (CTDE+GNN+LSTM)"     : "vdn_ctde_gnn_lstm_shared_seqlen8",
+        # "DQN (CTDE)"               : "qmix_ctde_mlp_shared",
+        # "DRQN (CTDE+LSTM)"         : "qmix_ctde_lstm_shared_seqlen8",
+        # "DQN (CTDE+GNN)"           : "qmix_ctde_gnn_shared",
+        # "DRQN (CTDE+GNN+LSTM)"     : "qmix_ctde_gnn_lstm_shared_seqlen8",
     }
 
     files = {

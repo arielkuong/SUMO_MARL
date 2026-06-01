@@ -206,7 +206,7 @@ def parse_args():
     p.add_argument("--duarouter-seed", type=int, default=2025, help="Seed for duarouter when using --trips")
     # Env
     p.add_argument("--grid-n", type=int, default=3, help="Grid size N (NxN core)")
-    p.add_argument("--steps", type=int, default=100, help="Episode steps (env steps)")
+    p.add_argument("--steps", type=int, default=200, help="Episode steps (env steps)")
     p.add_argument("--sumo-steps-per-env-step", type=int, default=5, help="SUMO internal steps per env step")
     p.add_argument("--gui", action="store_true", help="Use SUMO-GUI")
     p.add_argument("--gui-delay-ms", type=int, default=0, help="Delay per SUMO step in GUI")

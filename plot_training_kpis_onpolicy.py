@@ -62,7 +62,7 @@ def main():
         # "IA2C (MLP actor, LSTM critic)"             : "ia2c_mlp_actor_lstm_critic",
         "MA2C-PA (MLP)"                             : "ma2c_pa_mlp",
         "MA2C-PA (LSTM)"                            : "ma2c_pa_lstm",
-        "MA2C-PA (GNN)"                             : "ma2c_pa_gnn_attn",
+        "MA2C-PA (GNN)"                             : "ma2c_pa_gnn",
         "MA2C-PA (GNN+LSTM)"                        : "ma2c_pa_gnn_lstm",
         # "MA2C (MLP)"                                : "ma2c_mlp",
         # "MA2C-PA (MLP, team R)"                     : "ma2c_pa_mlp_teamreward",
