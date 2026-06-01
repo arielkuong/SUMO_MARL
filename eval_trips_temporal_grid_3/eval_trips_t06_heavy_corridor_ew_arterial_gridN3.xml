@@ -1,2 +1,0 @@
-<?xml version='1.0' encoding='utf-8'?>
-<routes><vType id="car" accel="2.0" decel="4.5" sigma="0.5" length="3.5" width="1.0" maxSpeed="16.7" vClass="passenger" guiShape="passenger" /><flow id="t06_w1_e1" type="car" begin="0.0" end="500.0" vehsPerHour="2400" from="e_fw1_to_n0_1" to="e_n2_1_to_fe1" /><flow id="t06_e1_w1" type="car" begin="0.0" end="500.0" vehsPerHour="1500" from="e_fe1_to_n2_1" to="e_n0_1_to_fw1" /></routes>
